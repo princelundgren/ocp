@@ -3,6 +3,14 @@
   "version": 1,
   "models": [
     {
+      "id": "claude-fable-5",
+      "displayName": "Claude Fable 5",
+      "openclawName": "Claude Fable 5 (via CLI)",
+      "reasoning": true,
+      "contextWindow": 200000,
+      "maxTokens": 16384
+    },
+    {
       "id": "claude-opus-4-8",
       "displayName": "Claude Opus 4.8",
       "openclawName": "Claude Opus 4.8 (via CLI)",
@@ -54,7 +62,8 @@
   "aliases": {
     "opus": "claude-opus-4-8",
     "sonnet": "claude-sonnet-5",
-    "haiku": "claude-haiku-4-5-20251001"
+    "haiku": "claude-haiku-4-5-20251001",
+    "fable": "claude-fable-5"
   },
   "legacyAliases": {
     "claude-opus-4": "claude-opus-4-7",
