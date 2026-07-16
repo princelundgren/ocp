@@ -468,6 +468,10 @@ const TOOL_TURN_QUIESCE_MS = parseIntEnv("OCP_TOOL_TURN_QUIESCE_MS", 2000);
 const ALLOWED_TOOLS = (process.env.CLAUDE_ALLOWED_TOOLS ||
   "Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch,Agent"
 ).split(",").map(s => s.trim()).filter(Boolean);
+// Fork-local (FLEET-32): `CLAUDE_ALLOWED_TOOLS=mcp__none` is this fleet's "zero tools" sentinel. Only
+// the exact single token counts. One derivation, read by buildCliArgs, the prompt-wrapper selection
+// and the boot banner, so the flags, the prompt and the banner cannot disagree about it.
+const ALLOWED_TOOLS_LOCKDOWN = ALLOWED_TOOLS.length === 1 && ALLOWED_TOOLS[0] === "mcp__none";
 const SYSTEM_PROMPT = process.env.CLAUDE_SYSTEM_PROMPT || "";
 // Max attempts (initial + retries) to coerce a valid structured-output (OpenAI response_format)
 // JSON response out of the model before rejecting. See runStructuredCompletion.
@@ -553,11 +557,11 @@ const AUTH_MODE = process.env.CLAUDE_AUTH_MODE || (PROXY_API_KEY ? "shared" : "n
 // Chosen from the tool surface the spawn ACTUALLY grants, so the prompt and the flags cannot drift
 // apart — which they had: see lib/prompt.mjs § selectPromptWrapper for the measurement.
 //
-// `AUTH_MODE === "multi"` is exactly buildCliArgs's own test for the branch that empties the schema
-// (`--tools ""`); every other branch leaves the model holding tools. Reading AUTH_MODE rather than
-// the env var is deliberate — it is the same value buildCliArgs branches on, so there is one
-// derivation, not two that could disagree.
-const TOOLS_GRANTED = AUTH_MODE !== "multi";
+// `AUTH_MODE === "multi"` and ALLOWED_TOOLS_LOCKDOWN are exactly buildCliArgs's own tests for the
+// two branches that empty the schema (`--tools ""`); every other branch leaves the model holding
+// tools. Reading those values rather than the env vars is deliberate — they are what buildCliArgs
+// branches on, so there is one derivation, not two that could disagree.
+const TOOLS_GRANTED = AUTH_MODE !== "multi" && !ALLOWED_TOOLS_LOCKDOWN;
 const SYSTEM_PROMPT_WRAPPER = selectPromptWrapper(
   { toolsGranted: TOOLS_GRANTED, localToolsInvited: LOCAL_TOOLS_ACTIVE },
   { negative: OCP_SYSTEM_PROMPT_WRAPPER, neutral: OCP_NEUTRAL_TOOLS_WRAPPER, positive: OCP_LOCAL_TOOLS_WRAPPER },
@@ -1679,6 +1683,15 @@ function buildCliArgs(cliModel, systemPromptFile, opts = {}) {
     args.push("--tools", "", "--strict-mcp-config", "--disallowedTools", "mcp__*");
     // Do NOT push --allowedTools in multi mode: it is a PRE-APPROVAL list ("tool names to
     // allow", per --help), not a restriction, so it could only ever widen this.
+  } else if (ALLOWED_TOOLS_LOCKDOWN) {
+    // FLEET-32 (fork-local). Passed through, the sentinel became `--allowedTools mcp__none` -- a
+    // pre-approval list, NOT an availability restriction, so a name matching no tool no-ops and
+    // every built-in stays live. Confirmed live 2026-07-16: it was granting full Bash/Read/Write/
+    // Edit access the whole time. Same empty-schema flags as the multi arm above, for the reasons
+    // recorded there; the --disallowedTools half also keeps an operator MCP_CONFIG (appended
+    // below) from re-adding tools. Checked BEFORE SKIP_PERMISSIONS so the most restrictive setting
+    // wins -- the same safety property as the TUI lockdown in lib/tui/session.mjs (PL-53).
+    args.push("--tools", "", "--strict-mcp-config", "--disallowedTools", "mcp__*");
   } else if (SKIP_PERMISSIONS) {
     args.push("--dangerously-skip-permissions");
   } else if (ALLOWED_TOOLS.length > 0) {
@@ -5959,6 +5972,7 @@ server.listen(PORT, BIND_ADDRESS, () => {
   // grandfathered) while the NAME it rested on did not, so a maintainer following the instruction
   // would have grepped /status, found nothing, and been unable to tell whether it applied.
   console.log(`Tools: ${AUTH_MODE === "multi" ? 'none (multi-tenant: --tools "" empties the built-in schema)'
+                      : ALLOWED_TOOLS_LOCKDOWN ? 'none (CLAUDE_ALLOWED_TOOLS=mcp__none: --tools "" empties the built-in schema)'
                       : SKIP_PERMISSIONS ? "all (skip-permissions)" : ALLOWED_TOOLS.join(", ")}`);
   if (SYSTEM_PROMPT) console.log(`System prompt: "${SYSTEM_PROMPT.slice(0, 80)}..."`);
   if (MCP_CONFIG) console.log(`MCP config: ${MCP_CONFIG}`);

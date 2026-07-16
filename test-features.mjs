@@ -5372,6 +5372,76 @@ ltTest("integration: the non-multi path still passes --allowedTools and never --
   } finally { _ltRmRetry(dir); }
 });
 
+// Fork-local (FLEET-32): buildCliArgs's FOURTH arm. CLAUDE_ALLOWED_TOOLS=mcp__none is the fleet's
+// zero-tools sentinel; passed through as `--allowedTools mcp__none` it pre-approved nothing and
+// restricted nothing, so every built-in stayed live. Booted in the production shape (no
+// SKIP_PERMISSIONS). The argv, banner and prompt are three claims killed by three different
+// mutations (buildCliArgs, the banner, TOOLS_GRANTED), so they share one boot.
+ltTest("integration: CLAUDE_ALLOWED_TOOLS=mcp__none spawns the empty-schema form and keeps the denying wrapper (FLEET-32)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv-lockdown.txt");
+  const spFile = join(dir, "sp-lockdown.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_AUTH_MODE: "none", CLAUDE_ALLOWED_TOOLS: "mcp__none", CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile, SP_CAPTURE: spFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `server never listened — ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, `expected the spawn to succeed — ${r.status} ${r.text.slice(0, 200)}`);
+
+      const argv = ltArgvCalls(argvFile);
+      assert.ok(argv.length > 0, `no argv captured: the fake never ran — ${ltDiag(buf)}`);
+      const spIdx = argv.indexOf("--system-prompt-file");
+      assert.ok(spIdx > -1, `argv has no --system-prompt-file: ${JSON.stringify(argv.slice(0, 8))}`);
+      assert.ok(argv.length > spIdx + 2, `argv ends at the system prompt: ${JSON.stringify(argv)}`);
+      const tail = argv.slice(spIdx + 2);
+      assert.deepEqual(tail, ["--input-format", "stream-json", "--tools", "", "--strict-mcp-config", "--disallowedTools", "mcp__*"],
+        `the mcp__none sentinel must reach the CLI as the empty-schema form, never --allowedTools: ${JSON.stringify(tail)}`);
+
+      const banner = buf.out.split("\n").find(l => l.startsWith("Tools: "));
+      assert.ok(banner, `no "Tools:" banner line at all — ${ltDiag(buf)}`);
+      assert.equal(banner, 'Tools: none (CLAUDE_ALLOWED_TOOLS=mcp__none: --tools "" empties the built-in schema)',
+        `the lockdown boot banner advertises a tool set: ${banner}`);
+
+      assert.ok(await ltWait(() => _ltExists(spFile)), `no --system-prompt-file content captured — ${ltDiag(buf)}`);
+      const sp = _ltRead(spFile, "utf8");
+      assert.ok(sp.includes(LT_NEG_MARK), `the schema is empty, so the DENYING wrapper is the true one. Got: ${sp.slice(0, 120)}`);
+      assert.ok(!sp.includes(LT_NEU_MARK), `lockdown must not use the neutral (tools-granted) wrapper: ${sp.slice(0, 120)}`);
+    } finally {
+      child.kill("SIGKILL");
+      await ltDrain(() => buf.closed, "lockdown-tools", 5000);
+    }
+  } finally { _ltRmRetry(dir); }
+});
+
+// The precedence half of the same arm, on its own boot because a reordering mutation leaves the
+// production-shaped test above green: the sentinel outranks CLAUDE_SKIP_PERMISSIONS, so no
+// combination of env re-grants tools on a host that asked for lockdown (as PL-53 does for TUI).
+ltTest("integration: CLAUDE_ALLOWED_TOOLS=mcp__none outranks CLAUDE_SKIP_PERMISSIONS (FLEET-32)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv-lockdown-skip.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_AUTH_MODE: "none", CLAUDE_ALLOWED_TOOLS: "mcp__none", CLAUDE_SKIP_PERMISSIONS: "true", CLAUDE_BIN: fake, ARGV_CAPTURE: argvFile }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `server never listened — ${ltDiag(buf)}`);
+      const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+      assert.equal(r.status, 200, `expected the spawn to succeed — ${r.status} ${r.text.slice(0, 200)}`);
+
+      const argv = ltArgvCalls(argvFile);
+      assert.ok(argv.length > 0, `no argv captured: the fake never ran — ${ltDiag(buf)}`);
+      const spIdx = argv.indexOf("--system-prompt-file");
+      assert.ok(spIdx > -1, `argv has no --system-prompt-file: ${JSON.stringify(argv.slice(0, 8))}`);
+      const tail = argv.slice(spIdx + 2);
+      assert.deepEqual(tail, ["--input-format", "stream-json", "--tools", "", "--strict-mcp-config", "--disallowedTools", "mcp__*"],
+        `skip-permissions re-opened the tool surface under lockdown: ${JSON.stringify(tail)}`);
+    } finally {
+      child.kill("SIGKILL");
+      await ltDrain(() => buf.closed, "lockdown-skip-tools", 5000);
+    }
+  } finally { _ltRmRetry(dir); }
+});
+
 // ── #370: the TUI LAN gate's call site (server.mjs:829) ────────────────────────────────────────
 // The #339 shape, one gate over: isLoopbackBind has 8 unit blocks and is correct; what nothing
 // asserted is that :829 still CONSULTS it. The question is not "is the predicate tested" but "does
