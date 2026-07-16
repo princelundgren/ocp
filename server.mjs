@@ -1099,20 +1099,18 @@ function buildCliArgs(cliModel, systemPrompt) {
   // For AUTH_MODE !== "multi" (none/shared — single-operator/trusted), preserve
   // existing behaviour unchanged.
   if (AUTH_MODE === "multi") {
-    // Disallow the full operator-FS + web + agent surface. "--disallowedTools" may
-    // be repeated; claude accepts multiple occurrences (TUI path already uses it).
-    args.push(
-      "--disallowedTools", "Bash",
-      "--disallowedTools", "Read",
-      "--disallowedTools", "Write",
-      "--disallowedTools", "Edit",
-      "--disallowedTools", "Glob",
-      "--disallowedTools", "Grep",
-      "--disallowedTools", "WebFetch",
-      "--disallowedTools", "WebSearch",
-      "--disallowedTools", "Agent",
-      "--disallowedTools", "mcp__*",
-    );
+    // FLEET-32 follow-up (2026-07-17): this deny-list was a hardcoded tool enumeration --
+    // confirmed live to miss every tool added since it was written (Monitor, NotebookEdit,
+    // the Cron* tools, Workflow, SendMessage, ToolSearch, and more -- 22 in total). A plain,
+    // non-adversarial prompt asking to run a shell command via the (undenied) Monitor tool
+    // executed for real. --tools "" structurally empties the ENTIRE tool schema instead of
+    // enumerating what to remove, so it can't go stale as new tools are added -- the same
+    // fix already applied to the ALLOWED_TOOLS branch below. --strict-mcp-config additionally
+    // suppresses account-level MCP connectors that survive --tools "" alone (confirmed during
+    // the original fix). This mode carries zero production traffic today (nothing sets
+    // CLAUDE_AUTH_MODE=multi) -- fixed anyway since it was a live, proven gap waiting for
+    // that switch to ever get flipped.
+    args.push("--tools", "", "--strict-mcp-config");
     // Do NOT push --allowedTools in multi mode.
   } else if (SKIP_PERMISSIONS) {
     args.push("--dangerously-skip-permissions");
