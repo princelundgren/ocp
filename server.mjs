@@ -1117,7 +1117,22 @@ function buildCliArgs(cliModel, systemPrompt) {
   } else if (SKIP_PERMISSIONS) {
     args.push("--dangerously-skip-permissions");
   } else if (ALLOWED_TOOLS.length > 0) {
-    args.push("--allowedTools", ...ALLOWED_TOOLS);
+    // --allowedTools is a pre-approval/skip-the-permission-prompt list (per Claude Code's
+    // own docs: "use certain tools without prompting"), NOT an availability restriction --
+    // an entry matching no real tool name silently no-ops, leaving ALL built-in tools
+    // available. Confirmed live 2026-07-16 (FLEET-32): this fleet's "mcp__none" sentinel,
+    // meant to mean "zero tools", was granting full Bash/Read/Write/Edit access the whole
+    // time. --tools "" genuinely empties the tool schema (confirmed via system.init's own
+    // tools array + a stable, repeated refusal under adversarial-prompt testing);
+    // --strict-mcp-config additionally suppresses account-level MCP connectors that survive
+    // --tools "" alone. Only handling the one sentinel value this fleet actually uses --
+    // a real non-empty CLAUDE_ALLOWED_TOOLS list would need its own fix (--tools takes an
+    // explicit list per --help, unverified here) if ever used; out of scope for this patch.
+    if (ALLOWED_TOOLS.length === 1 && ALLOWED_TOOLS[0] === "mcp__none") {
+      args.push("--tools", "", "--strict-mcp-config");
+    } else {
+      args.push("--allowedTools", ...ALLOWED_TOOLS);
+    }
   }
 
   // MCP config
