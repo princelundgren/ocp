@@ -39,7 +39,7 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { readFileSync, readdirSync, accessSync, existsSync, constants, chmodSync, statSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { DEFAULT_PORT } from "./lib/constants.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
@@ -1084,13 +1084,13 @@ const authCheckInterval = setInterval(checkAuth, 600000);
 // CLAUDE_SYSTEM_PROMPT env var is absorbed into the system prompt via
 // extractSystemPrompt() at the caller level; APPEND_SYSTEM_PROMPT no longer used.
 // Note: ALLOWED_TOOLS / SKIP_PERMISSIONS / MCP_CONFIG are preserved as before.
-function buildCliArgs(cliModel, systemPrompt) {
+function buildCliArgs(cliModel, systemPromptFile) {
   const args = [
     "--model", cliModel,
     "--output-format", "stream-json",
     "--verbose",
     "--no-session-persistence",
-    "--system-prompt", systemPrompt,
+    "--system-prompt-file", systemPromptFile,
   ];
 
   // Permissions
@@ -1241,11 +1241,11 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   stats.totalRequests++;
 
   // Phase 6c: always serialize full conversation via stdin (no session resume).
-  // System messages are extracted and passed via --system-prompt; the remaining
+  // System messages are extracted and passed via --system-prompt-file; the remaining
   // messages (user/assistant/tool) are serialized by messagesToPrompt.
   const systemPrompt = extractSystemPrompt(messages);
 
-  // messagesToPrompt skips system messages now that they go via --system-prompt.
+  // messagesToPrompt skips system messages now that they go via --system-prompt-file.
   // Filter them out before calling to avoid double-injection.
   const nonSystemMessages = messages.filter(m => m.role !== "system");
   const prompt = messagesToPrompt(nonSystemMessages);
@@ -1255,7 +1255,15 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
     console.log(`[session] stateless conv=${conversationId.slice(0, 12)}... key=${keyName || "anon"} msgs=${messages.length} prompt_chars=${prompt.length}`);
   }
 
-  const cliArgs = buildCliArgs(cliModel, systemPrompt);
+  // System prompt goes via a temp file, not argv: MAX_PROMPT_CHARS (below/via env) bounds the
+  // conversation but was never applied to systemPrompt itself, so a large enough system prompt
+  // (e.g. cognee's GRAPH_COMPLETION synthesis, which embeds retrieved graph context) overflows
+  // the OS argv+environ limit and spawn() fails with "spawn E2BIG". A file path has no such
+  // ceiling regardless of content size. Removed in cleanup() below on every exit path.
+  const systemPromptFile = join(tmpdir(), `ocp-sysprompt-${randomUUID()}.txt`);
+  writeFileSync(systemPromptFile, systemPrompt, "utf8");
+
+  const cliArgs = buildCliArgs(cliModel, systemPromptFile);
 
   const env = { ...process.env };
   delete env.CLAUDECODE;
@@ -1310,6 +1318,9 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
     // queued fallback waiter re-checks resolveSpawnToken() and proceeds ISOLATED with the now-fresh
     // token instead of piling into the real HOME. Idempotent; cleanup() is guarded by `cleaned`.
     try { if (decision.releaseFallback) decision.releaseFallback(); } catch { /* never throw out of cleanup */ }
+    // The --system-prompt-file temp file is single-use; remove it on every exit path. force:true
+    // makes this a no-op if the write itself failed and the file was never created.
+    try { rmSync(systemPromptFile, { force: true }); } catch { /* never let cleanup throw on a missing/locked file */ }
   }
 
   // Guarantee slot release on ANY exit path (normal close, error, timeout kill,
@@ -1346,7 +1357,7 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   proc.stdin.end();
 
   recordModelRequest(cliModel, prompt.length);
-  logEvent("info", "claude_spawned", { model: cliModel, promptChars: prompt.length, timeout: TIMEOUT, tier: getModelTier(cliModel), session: conversationId ? conversationId.slice(0, 12) + "..." : "none" });
+  logEvent("info", "claude_spawned", { model: cliModel, promptChars: prompt.length, systemPromptChars: systemPrompt.length, timeout: TIMEOUT, tier: getModelTier(cliModel), session: conversationId ? conversationId.slice(0, 12) + "..." : "none" });
 
   // Single request timeout — no separate first-byte timer.
   // Claude tool-use causes long pauses in the token stream (30s-5min),
