@@ -1987,6 +1987,49 @@ test("buildTuiCmd OCP_TUI_FULL_TOOLS=1 grants -p-equivalent tool surface (single
   }
 });
 
+// PL-53. Before this, CLAUDE_ALLOWED_TOOLS was read ONLY inside the full-tools branch, so the
+// fleet's mcp__none lockdown sentinel was silently inert in TUI mode: gate off, it was parsed and
+// discarded; gate on, it became --allowedTools mcp__none, a PRE-APPROVAL list that restricts
+// nothing. Built-in Bash stayed live either way — a pooled TUI session really did execute `pwd`
+// (2026-07-17) and really did read a random canary file (2026-07-22). These assertions exist so
+// that regression cannot return silently.
+test("buildTuiCmd CLAUDE_ALLOWED_TOOLS=mcp__none empties the tool schema (PL-53 lockdown)", () => {
+  const save = { ...process.env };
+  const restore = () => {
+    for (const k of ["OCP_TUI_FULL_TOOLS", "CLAUDE_MCP_CONFIG", "CLAUDE_ALLOWED_TOOLS"]) {
+      if (k in save) process.env[k] = save[k]; else delete process.env[k];
+    }
+  };
+  try {
+    // sentinel, gate off: --tools '' is the RESTRICTION (--allowedTools would only pre-approve)
+    delete process.env.OCP_TUI_FULL_TOOLS;
+    delete process.env.CLAUDE_MCP_CONFIG;
+    process.env.CLAUDE_ALLOWED_TOOLS = "mcp__none";
+    const lock = buildTuiCmd("/usr/bin/claude", "m", "s", "/home/u", "cli");
+    assert.ok(/--tools ''/.test(lock), "sentinel emits --tools '' (empty schema)");
+    assert.ok(lock.includes("--strict-mcp-config"), "sentinel keeps --strict-mcp-config");
+    assert.ok(!/--allowedTools/.test(lock), "sentinel must NOT use --allowedTools (pre-approval != restriction)");
+    assert.ok(!/mcp__none/.test(lock), "the sentinel is a marker, never passed through to claude");
+
+    // The safety property: the sentinel OUTRANKS the full-tools gate, so no combination of env
+    // can re-grant Bash on a host that asked for lockdown.
+    process.env.OCP_TUI_FULL_TOOLS = "1";
+    const both = buildTuiCmd("/usr/bin/claude", "m", "s", "/home/u", "cli");
+    assert.ok(/--tools ''/.test(both), "sentinel wins over OCP_TUI_FULL_TOOLS=1");
+    assert.ok(!/--allowedTools/.test(both), "full-tools gate must not re-open the surface under lockdown");
+
+    // Non-sentinel values are untouched: only the exact single token mcp__none locks down,
+    // matching server.mjs's -p branch (length === 1 && [0] === "mcp__none").
+    delete process.env.OCP_TUI_FULL_TOOLS;
+    process.env.CLAUDE_ALLOWED_TOOLS = "mcp__none,Bash";
+    const mixed = buildTuiCmd("/usr/bin/claude", "m", "s", "/home/u", "cli");
+    assert.ok(!/--tools ''/.test(mixed), "mcp__none alongside other tools is NOT the lockdown sentinel");
+    assert.ok(mixed.includes("--strict-mcp-config"), "non-sentinel gate-off still gets the MCP wall");
+  } finally {
+    restore();
+  }
+});
+
 test("reaper kills ONLY this instance's own port-scoped sessions, never olp-tui-", () => {
   const killed = [];
   const fakeTmux = (args) => {
