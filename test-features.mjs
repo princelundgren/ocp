@@ -9756,6 +9756,57 @@ ltTest("integration (ADR 0018): a TUI turn whose transcript never arrives is ALS
   } finally { child.kill("SIGKILL"); _ltRmRetry(dir); _ltRmRetry(home); }
 });
 
+// PL-70 (fork-local): request tracing on the TUI turn path. A tui_transcript_timeout used to reach
+// callClaudeTui's generic catch with no pane identity, no session id and no elapsed time, so a hung
+// turn left nothing to grep. Same hang fixture as the ADR 0018 test above, asserted on the log
+// lines instead: every event of the failed turn carries ONE turnId, and the wait and catch-all
+// events record where and why it ended.
+ltTest("integration (PL-70): a failed TUI turn logs slot, pane, wait and failure events under one turnId", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const home = ltMkdir(); const fake = ltAuthFake(dir);
+  const shimDir = join(dir, "nocreds"); _ltMkdirSync(shimDir, { recursive: true });
+  const securityStub = join(shimDir, "security");
+  _ltWrite(securityStub, "#!/bin/sh\nexit 1\n"); _ltChmod(securityStub, 0o755);
+  const tmux = ltTuiTmux(dir, "PONG", { hang: true });
+  const { child, buf, port } = await ltBootFresh({
+    ...tmux.env, CLAUDE_BIN: fake, HOME: home, CLAUDE_TUI_WALLCLOCK_MS: "2000",
+    PATH: `${shimDir}:${process.env.PATH}`,
+  }, dir);
+  try {
+    assert.ok(await ltWaitHealth(port, b => b.stats, 15000), `precondition: server must be up — ${ltDiag(buf)}`);
+    const r = await ltPostStatus(port, { model: "sonnet", messages: [{ role: "user", content: "ping" }] });
+    assert.equal(r.status, 500, `premise: the turn must fail — got ${r.status} ${r.text.slice(0, 200)}`);
+    assert.match(r.text, /tui_transcript_timeout/, `premise: it must fail at the transcript wait — ${r.text.slice(0, 200)}`);
+    assert.ok(await ltWait(() => buf.err.includes("tui_turn_failed")), `no tui_turn_failed line — ${ltDiag(buf)}`);
+
+    const events = (buf.out + "\n" + buf.err).split("\n")
+      .filter((l) => l.startsWith("{"))
+      .map((l) => { try { return JSON.parse(l); } catch { return null; } })
+      .filter((e) => e && typeof e.event === "string");
+    const one = (name) => {
+      const hits = events.filter((e) => e.event === name);
+      assert.equal(hits.length, 1, `expected exactly one ${name} event; got ${hits.length}`);
+      return hits[0];
+    };
+    const slot = one("tui_turn_acquired_slot");
+    assert.ok(typeof slot.turnId === "string" && slot.turnId.length > 0, `slot event carries no turnId: ${JSON.stringify(slot)}`);
+    assert.ok(Number.isFinite(slot.queueWaitMs), `slot event carries no queueWaitMs: ${JSON.stringify(slot)}`);
+
+    const pane = one("tui_turn_pane_acquired");
+    const start = one("tui_turn_wait_start");
+    const failed = one("tui_turn_wait_failed");
+    const catchAll = one("tui_turn_failed");
+    for (const e of [pane, start, failed, catchAll]) {
+      assert.equal(e.turnId, slot.turnId, `${e.event} is not correlated to the turn: ${JSON.stringify(e)}`);
+    }
+    assert.ok(pane.sessionId && pane.name, `pane event must name the pane and session: ${JSON.stringify(pane)}`);
+    assert.equal(failed.sessionId, pane.sessionId, "the wait failure must name the same session as the pane");
+    assert.match(String(failed.error), /tui_transcript_timeout/, `wait failure must carry the reason: ${JSON.stringify(failed)}`);
+    assert.ok(Number.isFinite(failed.elapsedMs), `wait failure must carry elapsedMs: ${JSON.stringify(failed)}`);
+    assert.equal(catchAll.timedOut, true, `the catch-all must record the turn as a timeout: ${JSON.stringify(catchAll)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); _ltRmRetry(home); }
+});
+
 // #362. The pool has two green tests either side of this state and none on it:
 // "M1b: shutdown drain kills the booting pane SYNCHRONOUSLY" proves cleanup for a pane the pool
 // still owns, and "a pane handed out for a turn leaves the spare set immediately" proves an

@@ -2704,12 +2704,18 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res, st
   const cliModel = MODEL_MAP[model] || model;
   const prompt = messagesToPrompt(messages, promptCharBudget(cliModel)); // includes system as [System] inline
   recordModelRequest(cliModel, prompt.length);
+  // Request-tracing correlation id (PL-70 follow-up — see the `log` param on runTuiTurn below).
+  // Generated BEFORE the semaphore wait, since queueing time is itself part of what a stuck
+  // request needs to be traced through: this id ties together the queue wait, the pane/session
+  // assigned, and the transcript-wait outcome, all previously unlogged/uncorrelated.
+  const turnId = randomUUID();
   // C-4: gate the heavy interactive boot behind the TUI semaphore (queuing if all slots are
   // busy, up to maxQueue). F2: `signal` (tied to `res` "close") cancels a QUEUED wait the
   // instant the client disconnects, so a dead socket never triggers a cold-boot tmux+claude
   // spawn; detach() drops the "close" listener as soon as the wait settles rather than
   // holding it for the whole (up to 120s) turn.
   const { signal, detach } = closeSignalFor(res);
+  const acquireStartedAt = Date.now();
   try {
     await tuiSemaphore.acquire(signal);
   } catch (err) {
@@ -2718,13 +2724,21 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res, st
       // L1: client-driven cancellation, not an upstream failure — info, not error (mirrors
       // acquireClaudeSlot's concurrency_wait_cancelled on the -p path).
       logEvent("info", "concurrency_wait_cancelled", {
-        reason: "client_disconnected", path: "tui", inflight: tuiSemaphore.inflight, queued: tuiSemaphore.queued,
+        turnId, reason: "client_disconnected", path: "tui", inflight: tuiSemaphore.inflight, queued: tuiSemaphore.queued,
+        queueWaitMs: Date.now() - acquireStartedAt,
       });
       throw new RequestDisconnectedError("client disconnected while waiting for a TUI concurrency slot");
     }
     throw err;
   }
   detach();
+  // Queue wait is frequently zero (a free slot was available) — logged every time anyway,
+  // matching this file's existing per-turn tui_pool_hit/tui_pool_miss convention, so an
+  // operator tracing turnId sees the full timeline including the fast-path turns, not just
+  // the slow ones. (PL-70: previously nothing recorded how long a turn spent queued at all.)
+  logEvent("info", "tui_turn_acquired_slot", {
+    turnId, model: cliModel, queueWaitMs: Date.now() - acquireStartedAt, inflight: tuiSemaphore.inflight,
+  });
   // release() runs in a finally so any throw from runTuiTurn (tmux spawn failure,
   // paste-not-landed) OR from the honesty gates below (truncation / error banner) can NEVER
   // leak a slot. tuiSemaphore.inflight feeds /health.
@@ -2789,6 +2803,10 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res, st
         ? ({ warm }) => logEvent("info", warm ? "tui_pool_hit" : "tui_pool_miss",
             { model: cliModel, warmRemaining: tuiPool.warm })
         : null,
+      // Request-tracing (PL-70 follow-up): unconditional, unlike onPane above — it must cover
+      // the cold-boot-only path too (pool off is the default), which previously had ZERO
+      // pane/session-level tracing at all. See the `log` param doc on runTuiTurn (session.mjs).
+      log: (level, event, data) => logEvent(level, event, { turnId, ...data }),
       onDelta,
       // Gated on TUI_STREAM (the deployment-wide switch), NOT on `assembler` (this REQUEST's
       // stream:true/false) — F4 fix. The pool's bootPane closure above installs the hook on
@@ -2927,7 +2945,7 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res, st
     // slot. Mirror the queued-disconnect handling above (info, no recordModelError, no
     // response) rather than booking a phantom model error against the socket going away.
     if (err && err.name === "TuiAbortError") {
-      logEvent("info", "tui_turn_aborted", { reason: "client_disconnected", model: cliModel });
+      logEvent("info", "tui_turn_aborted", { reason: "client_disconnected", model: cliModel, turnId });
       throw new RequestDisconnectedError("client disconnected mid-turn; TUI pane torn down");
     }
     // ADR 0018: the OTHER wall-clock outcome. readTuiTranscript polls to a single cap and then
@@ -2944,6 +2962,11 @@ async function callClaudeTui(model, messages, _conversationId, _keyName, res, st
       timedOut = true;
       stats.timeouts++;
     }
+    // PL-70 follow-up (fork-local): the catch-all log line, so no runTuiTurn/honesty-gate throw
+    // falls through without a turnId tying it back to the pane/session tracing above. Not a
+    // replacement for the specific-event logs (tui_wallclock_truncated, tui_upstream_error, ...);
+    // recordModelError and trackError below only bump counters and an in-memory ring.
+    logEvent("error", "tui_turn_failed", { turnId, model: cliModel, timedOut, error: err && err.message });
     recordModelError(cliModel, timedOut);
     // ADR 0018: the headline of #361 — a failed TUI turn is a failure OF THE PROXY, and until now
     // it reached no aggregate counter at all. Deliberately placed AFTER the TuiAbortError branch
