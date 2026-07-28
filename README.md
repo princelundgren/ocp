@@ -27,7 +27,7 @@ One proxy. Multiple IDEs. All models. **$0 API cost.**
 - [How It Works](#how-it-works)
 - Reference: [Available Models](#available-models) · [API Endpoints](#api-endpoints) · [Environment Variables](#environment-variables)
 - Modes & operations: [LAN & multi-user](#lan--multi-user) → [`docs/lan-mode.md`](docs/lan-mode.md) · [Subscription-pool (TUI) mode](#subscription-pool-tui-mode) → [`docs/tui-mode.md`](docs/tui-mode.md) · [Upgrading](#upgrading) → [`docs/upgrading.md`](docs/upgrading.md)
-- [Built-in Usage Monitoring](#built-in-usage-monitoring) · [Response Cache](#response-cache) · [OpenClaw Integration](#openclaw-integration)
+- [Built-in Usage Monitoring](#built-in-usage-monitoring) · [Response Cache](#response-cache) · [Structured Outputs](#structured-outputs-openai-response_format) · [Images / Multimodal](#images--multimodal-vision) · [OpenClaw Integration](#openclaw-integration)
 - [Troubleshooting](#troubleshooting) → [`docs/troubleshooting.md`](docs/troubleshooting.md)
 - [Repository Layout](#repository-layout) · [Security](#security) · [Governance](#governance) · [Support OCP](#support-ocp) · [License](#license)
 
@@ -113,11 +113,11 @@ node setup.mjs
 
 `setup.mjs` verifies the Claude CLI, starts the proxy on port 3456, and installs auto-start (launchd on macOS, systemd on Linux). The `ocp` CLI lands at `~/ocp/ocp` — symlink it onto your PATH (`sudo ln -sf ~/ocp/ocp /usr/local/bin/ocp`, or `ln -sf ~/ocp/ocp ~/.local/bin/ocp`) or alias it (`alias ocp=~/ocp/ocp`); the rest of the docs assume `ocp` is on your PATH.
 
-**Verify** — should list 6 models:
+**Verify** — should list 7 models:
 
 ```bash
 curl http://127.0.0.1:3456/v1/models
-# claude-opus-4-8, claude-opus-4-7, claude-opus-4-6, claude-sonnet-5, claude-sonnet-4-6, claude-haiku-4-5-20251001
+# claude-opus-5, claude-opus-4-8, claude-opus-4-7, claude-opus-4-6, claude-sonnet-5, claude-sonnet-4-6, claude-haiku-4-5-20251001
 ```
 
 **Connect one IDE** — point any OpenAI-compatible tool at the proxy, then reload your shell and start a tool (Cline / Continue / Cursor / OpenCode):
@@ -159,7 +159,7 @@ OCP translates OpenAI-compatible `/v1/chat/completions` requests into `claude --
 
 OCP is a **text-prompt bridge** to the official `claude` CLI. It does **not** pass through OpenAI `tools`/`functions` payloads or Anthropic `tool_use` blocks to the client. Clients (Cline, Cursor, OpenClaw, etc.) pointed at OCP receive **assistant TEXT only** — they never get `tool_calls` to execute locally.
 
-Any tool use happens server-side, under the `--allowedTools` set configured on the OCP host. In default mode (no `CLAUDE_NO_CONTEXT`), the `claude` CLI's own built-in tools are available to the model; in TUI mode, the operator controls the tool surface via `OCP_TUI_FULL_TOOLS`. Either way, the tools run under the operator's credentials on the server, and the client sees only the final text output.
+Any tool use happens server-side, under the `--allowedTools` set configured on the OCP host. In default mode (no `CLAUDE_NO_CONTEXT`), the `claude` CLI's own built-in tools are available to the model; in TUI mode, the operator controls the tool surface via `OCP_TUI_FULL_TOOLS`. Either way, the tools run under the operator's credentials on the server, and the client sees only the final text output. Note that on the `-p` path OCP prepends a system-prompt wrapper telling the model it has **no** local access (right for a shared gateway) — a single-user loopback instance whose model *should* use its tools can flip this with `OCP_LOCAL_TOOLS=1` (see Environment Variables).
 
 **Client-local tool execution is not supported by design.** Supporting it would require bypassing the `claude` CLI to call the raw Anthropic API directly — that is a different product, and is out of scope per `ALIGNMENT.md` (every OCP endpoint must correspond to something `cli.js` actually does).
 
@@ -169,14 +169,15 @@ Any tool use happens server-side, under the `--allowedTools` set configured on t
 
 | Model ID | Notes |
 |----------|-------|
-| `claude-opus-4-8` | Most capable (default for `opus` alias) |
-| `claude-opus-4-7` | Previous Opus, retained for pinning |
+| `claude-opus-5` | Most capable (default for `opus` alias) |
+| `claude-opus-4-8` | Previous Opus, retained for pinning |
+| `claude-opus-4-7` | Older Opus, retained for pinning |
 | `claude-opus-4-6` | Older Opus, retained for pinning |
 | `claude-sonnet-5` | Latest Sonnet (default for `sonnet` alias) |
 | `claude-sonnet-4-6` | Previous Sonnet, retained for pinning |
 | `claude-haiku-4-5-20251001` | Fastest, lightweight (default for `haiku` alias) |
 
-The canonical list lives in [`models.json`](./models.json) — the single source of truth as of v3.11.0. Both `server.mjs` (the `/v1/models` endpoint) and `setup.mjs` (the OpenClaw registration) derive from it. Adding a new model is now a one-file edit:
+The canonical list lives in [`models.json`](./models.json) — the single source of truth as of v3.11.0, validated in CI against [`models.schema.json`](./models.schema.json). Both `server.mjs` (the `/v1/models` endpoint) and `setup.mjs` (the OpenClaw registration) derive from it. Adding a new model is now a one-file edit:
 
 ```bash
 # 1. Edit models.json — add an entry
@@ -222,12 +223,20 @@ The canonical list lives in [`models.json`](./models.json) — the single source
 | `CLAUDE_MAX_CONCURRENT` | `8` | Max concurrent claude processes (`-p`/stream-json path) |
 | `CLAUDE_MAX_QUEUE` | `16` | Max requests **waiting** for a `-p` concurrency slot. Beyond `CLAUDE_MAX_CONCURRENT`, requests queue (up to this cap) instead of being rejected; when the queue is **also** full, the request gets `HTTP 429` + `Retry-After` (not an opaque 500). Surfaced on `/health.concurrency` + `/health.stats.queueRejections`. |
 | `CLAUDE_QUEUE_RETRY_AFTER` | `5` | Seconds advertised in the `Retry-After` header on a `-p` concurrency-overflow `429`. |
-| `CLAUDE_MAX_PROMPT_CHARS` | `150000` | Prompt truncation limit (chars) |
+| `CLAUDE_MAX_PROMPT_CHARS` | *(derived)* | Prompt truncation limit in chars. Default derives from the models.json SPOT: `max(contextWindow) × 3` — currently **600,000** (≈150–200k tokens). Setting this env var (or the runtime settings API) overrides the derivation absolutely. See [ADR 0009](docs/adr/0009-spot-derived-prompt-budget.md). Note: very large prompts burn subscription-window quota quickly and slow TTFT; the TUI-mode paste path is untested beyond ~hundreds of KB. Applies to **text only** — image bytes bypass this budget (see [Images / Multimodal](#images--multimodal-vision)). |
+| `OCP_STRUCTURED_MAX_ATTEMPTS` | `3` | Max attempts (initial + retries) to coerce a schema-valid JSON reply when a request uses OpenAI `response_format`. Fail-closed: a non-numeric value keeps the default. See [Structured Outputs](#structured-outputs-openai-response_format). |
 | `CLAUDE_SESSION_TTL` | `3600000` | Session expiry (ms, default: 1 hour) |
 | `CLAUDE_CACHE_TTL` | `0` | Response cache TTL (ms, 0 = disabled). Set to e.g. `300000` for 5-min cache. See [Response Cache](#response-cache). |
 | `CLAUDE_ALLOWED_TOOLS` | `Bash,Read,...,Agent` | Comma-separated tools to pre-approve |
 | `CLAUDE_SKIP_PERMISSIONS` | `false` | Bypass all permission checks |
 | `CLAUDE_MCP_CONFIG` | *(unset)* | Path to an MCP server config JSON, passed to the spawned `claude` as `--mcp-config` (both the `-p` path and TUI `OCP_TUI_FULL_TOOLS` panes) |
+| `CLAUDE_MAX_BODY_SIZE` | `5242880` | Max request body size (bytes, default 5 MB). Base64 image payloads inflate ~33%; raise this to admit larger multimodal requests. Fail-closed parsing: a garbage value keeps the default. |
+| `CLAUDE_IMAGE_ALLOW_URL` | `false` | Allow remote `http(s)` image URLs in `image_url` parts. **Off by default** (v1 supports base64 `data:` URIs only). When on, the URL is passed through to Anthropic as a `url` image source — **OCP does not fetch it** (no OCP-side SSRF surface); unreachable/blocked URLs surface as an API error. |
+| `CLAUDE_MAX_IMAGE_BYTES` | `5242880` | Per-image decoded-byte cap (default 5 MB). Over-cap images get `HTTP 413`. |
+| `CLAUDE_MAX_IMAGES` | `20` | Max image parts per request. Over-cap gets `HTTP 413`. |
+| `CLAUDE_MAX_IMAGE_TOTAL_BYTES` | `20971520` | Aggregate decoded-byte cap across all images in a request (default 20 MB). Over-cap gets `HTTP 413`. |
+| `CLAUDE_SYSTEM_PROMPT` | *(unset)* | Operator-wide system-prompt text appended (last) to every request's composed system prompt on the default `-p` path. TUI-mode panes are unaffected (they keep the interactive CLI's own system prompt). Echoed truncated on `/health.systemPrompt`. Note: changing this value and restarting auto-invalidates the response cache (the key carries a boot-config epoch, #177). |
+| `OCP_LOCAL_TOOLS` | *(unset)* | **Single-user, loopback only.** `=1` swaps the default *"you have no local filesystem/shell access"* system-prompt wrapper for a positive one telling the model it **may** use its tools. These are the **server-side `claude` tools** OCP spawns via `-p` (`--allowedTools`) — which, on a loopback instance, run on the operator's own machine, i.e. *local* tools. For a personal instance (e.g. an **OpenClaw** agent on its own local OCP) the default wrapper otherwise makes the model refuse to use tools it legitimately has. Changes **only the prompt**, never the tool surface (governed by `--allowedTools`/`--disallowedTools`; multi-tenant still `--disallowedTools` the whole FS surface). **Does not** enable client-side `tool_calls` for OpenClaw/Cline/etc. — that remains unsupported by design (see § How tools work). Fail-closed: OCP **refuses to boot** if `=1` is combined with `CLAUDE_AUTH_MODE=multi`, a non-loopback bind, or `PROXY_ANONYMOUS_KEY` (mirrors `OCP_TUI_FULL_TOOLS`, ADR 0007). **Inert in TUI mode** (the `-p` wrapper is unused there; the TUI tool surface is `OCP_TUI_FULL_TOOLS`) — a warning is logged. Off by default → the default path is byte-for-byte unchanged. Toggling it auto-invalidates the standard response cache (boot-config epoch, #177). |
 | `CLAUDE_NO_CONTEXT` | `false` | Suppress CLAUDE.md and auto-memory injection (pure API mode) |
 | `PROXY_API_KEY` | *(unset)* | Bearer token for shared-mode authentication |
 | `PROXY_ANONYMOUS_KEY` | *(unset)* | Well-known anonymous key (multi mode) — this exact string bypasses `validateKey()` and grants public access. Exposed via `/health.anonymousKey` only to localhost, or to all callers when `PROXY_ADVERTISE_ANON_KEY=1`. Full setup + security notes: [docs/lan-mode.md § Anonymous Access](docs/lan-mode.md#anonymous-access-optional). |
@@ -379,7 +388,115 @@ curl -X DELETE http://127.0.0.1:3456/cache   # clear all cached responses
 ocp settings cacheTTL 0                       # disable at runtime
 ```
 
-Cache is **disabled by default** (`CLAUDE_CACHE_TTL=0`). All data is stored locally in `~/.ocp/ocp.db`. **Hash format upgrade in v3.13.0:** legacy `v1` cache rows don't match new `v2`-format lookups; they orphan and are reaped by the TTL cleanup interval within one window — no migration script required.
+Cache is **disabled by default** (`CLAUDE_CACHE_TTL=0`). All data is stored locally in `~/.ocp/ocp.db`. **Cache keys resolve model aliases as of v3.25.0:** a request for an alias (`opus`, `sonnet`, `haiku`, or a legacy alias like `claude-haiku-4-5`) is now keyed on the canonical model it resolves to, not on the string the client sent. Two consequences, both one-time and self-healing: rows written before the upgrade don't match the new lookups, so they orphan and are reaped by the TTL cleanup interval within one window — no migration script required; and an alias now correctly shares a cache slot with its canonical id, since both produce an identical spawn. Scope: for the **normal** cache only alias-addressed rows rekey — rows keyed on a literal model id keep matching, *unless* you run `OCP_LOCAL_TOOLS=1`, in which case the whole normal cache rekeys once because v3.25.0 also reworded that wrapper and the wrapper text feeds the config epoch. **Every structured-output row rekeys regardless**, since the same change folds the config epoch into the structured key, which it previously omitted. This is what makes an alias repoint (such as v3.25.0's `opus` → `claude-opus-5`) take effect immediately instead of being masked by the cache until TTL expiry. **Hash format upgrade in v3.13.0:** legacy `v1` cache rows don't match new `v2`-format lookups; they orphan and are reaped by the TTL cleanup interval within one window — no migration script required.
+
+## Structured Outputs (OpenAI `response_format`)
+
+`/v1/chat/completions` honors OpenAI's [`response_format`](https://platform.openai.com/docs/api-reference/chat/create#chat-create-response_format) parameter so OpenAI-SDK clients that require machine-parseable JSON (Home Assistant AI Tasks, Honcho, BYO scripts) get JSON in `choices[].message.content` — not prose.
+
+Supported shapes:
+
+- `response_format: { "type": "json_schema", "json_schema": { "name", "strict", "schema" } }`
+- `response_format: { "type": "json_object" }`
+- `json_mode: true` — non-standard top-level alias honored by several OpenAI-compatible clients; treated as `json_object`.
+
+When a structured request is detected, OCP:
+
+1. Appends a strict JSON-only steering instruction to the request (no Markdown, no fences, no prose, must begin with `{` or `[`).
+2. Extracts the JSON from the model reply (unwraps a stray code fence / prose via a string-aware balanced slice).
+3. For `json_schema`, validates the result against the supplied schema (types, `required`, `enum`, `const`, `additionalProperties`, nullability, `items`, `min/maxItems`, and `$ref`/`$defs` + `allOf`/`anyOf`/`oneOf` composition — the shapes the official OpenAI SDK emits via `zodResponseFormat` / `client.beta.chat.completions.parse`). For `json_object`, the whole reply must parse as a single JSON value (a stray brace inside prose is not served as the answer).
+4. On a parse/validation miss, retries with a stronger instruction that names the failure, up to `OCP_STRUCTURED_MAX_ATTEMPTS` (default 3).
+5. If no valid JSON can be produced, returns OpenAI's assistant **`refusal`** field (`HTTP 200`, `message.content: null`, `message.refusal: "<reason>"`, `finish_reason: "stop"`) — the spec's own mechanism for "the model would not produce the required output" — rather than an invented error type or passing prose through. SDK clients take their written `refusal` branch.
+
+A reply that carries **more than one** top-level JSON value (e.g. `Schema: {…}` then `Answer: {…}`) is rejected as ambiguous rather than silently serving the first — OCP never serves an unvalidated or arbitrarily-chosen extraction.
+
+`message.content` for a structured request is the raw JSON string only — no fences, no reasoning, no wrapper. Non-structured requests are completely unaffected (normal conversational behaviour, streaming included). This is a Class B.1 endpoint extension authorized by ADR 0006; the pure logic lives in [`lib/structured-output.mjs`](./lib/structured-output.mjs) and is unit-tested in `test-features.mjs`.
+
+**Caching & cost.** A structured request can cost up to `OCP_STRUCTURED_MAX_ATTEMPTS` metered `claude` spawns — each retry is a fresh spawn, burning subscription-window quota today and metered credits if the (currently **paused**) 2026-06-15 billing split re-lands (see the billing-policy status note in [How It Works](#how-it-works)) — so this feature adds cost-attack surface. Two guards bound it: (a) identical **concurrent** structured requests share one flight (single-flight dedup, so N callers ≠ N× spawns), and (b) when `CLAUDE_CACHE_TTL > 0`, a **validated** result is cached on a **structured-keyed** hash (the `response_format`/schema is folded into the key, so a JSON reply never collides with the conversational answer and different schemas never share a slot). A refusal is never cached. Operators concerned about cost can lower `OCP_STRUCTURED_MAX_ATTEMPTS` to `1` (no retries) or gate the surface behind per-key quotas (`/api/keys/:id/quota`).
+## Images / Multimodal (Vision)
+
+`POST /v1/chat/completions` accepts OpenAI-style multimodal `content` parts, so a
+message can carry images alongside text and Claude will actually see them. This
+follows OpenAI's [vision](https://platform.openai.com/docs/guides/vision) /
+[chat-completions `image_url`](https://platform.openai.com/docs/api-reference/chat/create#chat-create-messages)
+request shape — no OCP-invented fields. (Class B.1 endpoint; see ADR 0006.)
+
+Under the hood, when a request carries an image OCP feeds the conversation to the
+Claude CLI as Anthropic image blocks over `--input-format stream-json`. Text-only
+requests are completely unaffected (unchanged code path).
+
+### Supported input
+
+- **Base64 data URIs** (default, recommended):
+  `data:image/png;base64,<...>`. Media types: `image/jpeg`, `image/png`,
+  `image/gif`, `image/webp`.
+- **Remote `http(s)` URLs** — **off by default**. Set `CLAUDE_IMAGE_ALLOW_URL=1`
+  to enable; the URL is passed through to Anthropic (OCP never fetches it itself,
+  so there is no OCP-side SSRF surface).
+- Images may appear in **any** message in the history (multi-turn), not just the
+  last one.
+- Non-image, non-text parts (audio, files) are **not** yet supported and are
+  replaced with a `[non-text content omitted]` placeholder (deferred to a future
+  version).
+
+### Example (base64 data URI)
+
+```bash
+curl -X POST http://127.0.0.1:3456/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "claude-sonnet-4-6",
+    "messages": [{
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "What is in this image?" },
+        { "type": "image_url",
+          "image_url": { "url": "data:image/png;base64,iVBORw0KGgoAAA..." } }
+      ]
+    }]
+  }'
+```
+
+### Not supported in TUI mode
+
+Multimodal images require the default `-p` spawn path. In **TUI / subscription-pool
+mode** (`CLAUDE_TUI_MODE=true`) the CLI is driven interactively and cannot carry
+image blocks, so a request with an `image_url` part returns **`400
+images_unsupported_in_tui_mode`** rather than silently dropping the image and
+answering about something the model never saw. Remove the images, or run OCP
+without TUI mode, to use vision.
+
+Images must also live in a **user or assistant** message, not a `system` message
+(system content is not forwarded to the CLI as image blocks). An `image_url` part
+present only in a system message returns **`400 images_unsupported_in_system_messages`**
+for the same reason — fail loudly rather than answer about an unseen image. This matches
+the OpenAI vision spec, which does not place images in the system role.
+
+### Limits
+
+Images bypass the text `CLAUDE_MAX_PROMPT_CHARS` budget and are instead bounded by
+their own byte/count caps. The **text** in a multimodal request is still subject to
+`CLAUDE_MAX_PROMPT_CHARS` (older text is truncated exactly as on the text-only
+path — only the image bytes are exempt). All numeric caps are parsed **fail-closed**:
+a malformed value (e.g. `CLAUDE_MAX_BODY_SIZE=unlimited` or `=5MB`) is rejected with
+a startup warning and the safe default is kept — a misconfigured cap can never
+silently disable the guard. Requests that violate a cap get a clear `4xx` (never a
+silent drop):
+
+| Cap | Env var | Default | Error |
+|-----|---------|---------|-------|
+| Request body | `CLAUDE_MAX_BODY_SIZE` | 5 MB | `413` request body too large |
+| Per-image bytes | `CLAUDE_MAX_IMAGE_BYTES` | 5 MB | `413` `image_too_large` |
+| Total image bytes | `CLAUDE_MAX_IMAGE_TOTAL_BYTES` | 20 MB | `413` `images_too_large` |
+| Image count | `CLAUDE_MAX_IMAGES` | 20 | `413` `too_many_images` |
+| Unsupported media type | — | — | `400` `unsupported_image_type` |
+| Malformed data URI | — | — | `400` `invalid_data_uri` |
+| Remote URL while disabled | `CLAUDE_IMAGE_ALLOW_URL` | off | `400` `remote_url_disabled` |
+
+Base64 payloads are large: a 5 MB image is ~6.7 MB as a data URI, so raise
+`CLAUDE_MAX_BODY_SIZE` (and, if needed, `CLAUDE_MAX_IMAGE_BYTES`) to admit big
+images. Vision support depends on the target model — request a current
+vision-capable Claude model.
 
 ## OpenClaw Integration
 
@@ -424,6 +541,7 @@ The simplest path: ask your AI — paste `Run `ocp doctor` and follow its `next_
 
 - **A TUI session vanished right after upgrading OCP** — if a pre-3.21.1 and a post-3.21.1 instance ran on the same host at the same time during an upgrade, the new instance's one-time boot reap can, once, kill an old-format (`ocp-tui-<8hex>`) live TUI session belonging to the still-running old instance. Restart the affected session (`ocp restart` or re-run your TUI turn) and it returns under the new instance's port-scoped naming.
 - **OpenClaw shows old models after `ocp update` (v3.10→v3.11 only)** — the running shell had the old `cmd_update` cached, so the sync hook doesn't fire on that single jump. Run once: `node ~/ocp/scripts/sync-openclaw.mjs && openclaw gateway restart`. Every future update syncs automatically.
+- **Response-cache hit rate drops once after upgrading to v3.25.0** — only if you run with the cache on (`CLAUDE_CACHE_TTL > 0`; it is off by default). v3.25.0 keys the cache on the resolved model instead of the string the client sent, so alias-addressed rows (and *all* structured-output rows) orphan and are reaped by the TTL cleanup within one window. **No action required.** Details: [docs/troubleshooting.md#cache-rekey-v3250](docs/troubleshooting.md#cache-rekey-v3250).
 
 Full manual — setup failures, env-var-not-taking-effect-after-restart (launchd bootout+bootstrap vs `kickstart -k`), stuck sessions, "OpenClaw registry out of sync", and the two-layer TUI-mode 401 root cause + fix: **[docs/troubleshooting.md](docs/troubleshooting.md)**.
 

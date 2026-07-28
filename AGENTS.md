@@ -30,6 +30,7 @@ Runtime: Node.js (ESM, `.mjs` throughout). No build step. No bundler. `server.mj
 
 - `server.mjs` — the proxy itself; every request path lives here. Governed by `ALIGNMENT.md`.
 - `models.json` — single source of truth for model IDs, aliases, and context windows. See ADR 0003.
+- `models.schema.json` — the schema `models.json` declares in its `$schema`. CI validates the SPOT against it (`test-features.mjs`) using the repo's own `validateJsonSchema`, so a malformed entry fails the build instead of surfacing downstream in OpenClaw.
 - `setup.mjs` — first-time installer; reads `models.json` to derive bootstrap config.
 - `scripts/sync-openclaw.mjs` — idempotent OpenClaw registry sync invoked by `ocp update`. See ADR 0004.
 - `ocp` — user-facing CLI (install, update, start, stop, status, logs, etc.).
@@ -51,6 +52,22 @@ Runtime: Node.js (ESM, `.mjs` throughout). No build step. No bundler. `server.mj
 - **OpenClaw boundary.** `scripts/sync-openclaw.mjs` only writes `models.providers["claude-local"].models` and `agents.defaults.models["claude-local/*"]` in `~/.openclaw/openclaw.json`. Do not expand scope. See ADR 0004.
 
 ---
+
+## Testing: reaching faults inside `server.mjs`
+
+`test-features.mjs` cannot `import` `server.mjs` (it calls `server.listen()` at top level), and that has twice led to the wrong conclusion that a class of bug is untestable. It isn't. Read this before writing "no regression test is possible here".
+
+**There is a real live-server fixture.** `ltBoot(env, dir, nodeArgs)` (around `test-features.mjs:990`) spawns the actual `server.mjs` as a child with a **fake `claude` binary**, so integration tests cost no quota. `ltPost` / `ltPostStatus` / `ltWait` / `ltFreePort` round it out. It already covers boot gates, cache-epoch invalidation across two boots sharing one SQLite store, and system-prompt capture.
+
+**`--stack-size` is a fault lever.** `ltBoot`'s third argument passes V8 flags to the child, which puts recursion- and argument-count-limited failures in reach at a much smaller input. `#193` needed a *synchronous throw* deep inside `spawnClaudeProcess`; `buildCliArgs` does `args.push("--allowedTools", ...ALLOWED_TOOLS)`, and under `--stack-size=200` that spread throws at ~24k elements instead of ~124k — which is what brings the trigger under Linux's `MAX_ARG_STRLEN` (131072 bytes for a single env string) so the test runs in CI rather than skipping. **No production fault hook was needed.**
+
+Three rules that made it hold up, all learned the hard way:
+
+- **Discover the threshold in a child under the same flags**, never in the test process — the parent's stack is not the one that matters.
+- **Assert that the fault actually fired**, not just that the outcome looks right. `#193` asserts HTTP 500 *and* that the body carries `call stack size exceeded`; a control mutation (trigger neutered, bug still present) proves the test fails rather than passing vacuously.
+- **Wait for the thing you are about to assert**, not a proxy for it. Waiting on `listening on` and then asserting a different line is a race (`#199`); waiting for the process to *exit* and then reading its `stderr` is another, because a terminated child's pipes may still hold unread data (`#203` — wait for the stdio to close, not for the exit).
+
+Allocate ports with `ltFreePort()`. Fixed ports have caused at least one flake here.
 
 ## Release protocol
 

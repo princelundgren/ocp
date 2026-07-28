@@ -35,13 +35,14 @@
  */
 import { createServer } from "node:http";
 import { spawn, execFileSync, spawnSync } from "node:child_process";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual, createHash as cryptoCreateHash } from "node:crypto";
 import { readFileSync, readdirSync, accessSync, existsSync, constants, chmodSync, statSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { validateKey, recordUsage, getUsageByKey, getUsageTimeline, getRecentUsage, createKey, listKeys, revokeKey, closeDb, checkQuota, updateKeyQuota, getKeyQuota, findKey, cacheHash, getCachedResponse, setCachedResponse, clearCache, getCacheStats, hasCacheControl, singleflight, getInflightStats } from "./keys.mjs";
 import { DEFAULT_PORT } from "./lib/constants.mjs";
+import { StructuredOutputError, detectStructuredOutput, validateJsonSchemaSafe, extractJsonPayload, structuredSystemInstruction, resolveMaxAttempts } from "./lib/structured-output.mjs";
 import { isLoopbackBind } from "./lib/net.mjs";
 import { runTuiTurn, reapStaleTuiSessions, resolveTuiHome, bootTuiPane, tuiPaneHealthy, poolPaneName, POOL_BOOT_MS } from "./lib/tui/session.mjs";
 import { detectTuiUpstreamError } from "./lib/tui/transcript.mjs";
@@ -49,6 +50,9 @@ import { TuiSemaphore, SemaphoreAbortError, recordTuiEntrypoint, buildTuiHealthB
 import { TuiPanePool, resolvePoolSize, POOL_MAX_SIZE } from "./lib/tui/pool.mjs";
 import { TuiDeltaAssembler, DEFAULT_HOLDBACK_CHARS, resolveStreamHoldback } from "./lib/tui/stream.mjs";
 import { createSerialMutex, createTtlCache, isTokenExpiring, orderLabelsLastGoodFirst } from "./lib/spawn-auth.mjs";
+import { hasImageContent, buildImageBlocks, buildStreamJsonInput, MultimodalError } from "./lib/multimodal.mjs";
+import { parsePositiveInt } from "./lib/env.mjs";
+import { appendOperatorPrompt, derivePromptCharBudget, selectPromptWrapper, localToolsSafetyError } from "./lib/prompt.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
@@ -194,18 +198,40 @@ function resolveClaude() {
 // Reference: https://github.com/dtzp555-max/olp commit 97e7d16 (Phase 6c)
 const OCP_SYSTEM_PROMPT_WRAPPER = `You are accessed via the OCP HTTP proxy. You do NOT have access to any local filesystem, working directory, shell, git status, or machine environment. Do not infer or invent such information from any context you observe. Respond only based on the conversation provided.`;
 
-// Build the full system-prompt string: OCP_SYSTEM_PROMPT_WRAPPER prepended,
-// then any system-role messages from the request appended (separated by blank line).
-// ADR 0009 Amendment 1 analogue § "OLP system prompt wrapper".
+// Positive counterpart used only when OCP_LOCAL_TOOLS=1 — a single-user, loopback-bound instance
+// where the operator's own model legitimately has tools (the `-p` path passes --allowedTools). Tells
+// the model it MAY use them instead of disclaiming access it actually holds. Off by default; the
+// default wrapper above is byte-for-byte unchanged. Selecting the positive wrapper does NOT expand
+// the tool surface (governed independently by --allowedTools/--disallowedTools) — it only changes the
+// prompt — and is boot-gated below (multi/non-loopback/anon → refuse) mirroring OCP_TUI_FULL_TOOLS.
+const OCP_LOCAL_TOOLS_WRAPPER = `You are accessed via the OCP HTTP proxy running on the operator's own machine. Unlike the shared-gateway posture, you may use your available local tools to act on the operator's machine as the task requires. Use only the tools you actually have — do not assume filesystem, shell, or other access beyond the tool set provided to you in this session.`;
+
+// OCP_LOCAL_TOOLS is inert in TUI mode: the interactive (non-`-p`) path composes its own prompt via
+// callClaudeTui/messagesToPrompt and never calls extractSystemPrompt, so the wrapper is only ever
+// applied on the `-p` path. LOCAL_TOOLS_ACTIVE is the single source of truth (hoisted once, house
+// style) used by the wrapper selection, the boot gate, and the startup notice — so the flag is
+// enabled/announced/gated in exactly the mode where it has an effect. (TUI tool surface is governed
+// by OCP_TUI_FULL_TOOLS instead.)
+const LOCAL_TOOLS = process.env.OCP_LOCAL_TOOLS === "1";
+const LOCAL_TOOLS_ACTIVE = LOCAL_TOOLS && process.env.CLAUDE_TUI_MODE !== "true";
+
+// The wrapper actually prepended to each request's system prompt, chosen once at startup.
+const SYSTEM_PROMPT_WRAPPER = selectPromptWrapper(LOCAL_TOOLS_ACTIVE, OCP_SYSTEM_PROMPT_WRAPPER, OCP_LOCAL_TOOLS_WRAPPER);
+
+// Build the full system-prompt string: SYSTEM_PROMPT_WRAPPER prepended,
+// then any system-role messages from the request appended (separated by blank line),
+// then the operator-wide CLAUDE_SYSTEM_PROMPT appended LAST (lib/prompt.mjs — a
+// no-op returning the same string when the var is unset, so the default path is
+// byte-for-byte unchanged). ADR 0009 Amendment 1 analogue § "OLP system prompt wrapper".
 function extractSystemPrompt(messages) {
   const systemMessages = (messages ?? []).filter(m => m.role === "system");
   if (systemMessages.length === 0) {
-    return OCP_SYSTEM_PROMPT_WRAPPER;
+    return appendOperatorPrompt(SYSTEM_PROMPT_WRAPPER, SYSTEM_PROMPT);
   }
   const clientContent = systemMessages.map(m =>
     contentToText(m.content)
   ).join("\n\n");
-  return `${OCP_SYSTEM_PROMPT_WRAPPER}\n\n${clientContent}`;
+  return appendOperatorPrompt(`${SYSTEM_PROMPT_WRAPPER}\n\n${clientContent}`, SYSTEM_PROMPT);
 }
 
 // ── NDJSON line buffer parser (Phase 6c port) ─────────────────────────────
@@ -245,8 +271,8 @@ function parseStreamJsonLines(buffered) {
 // Reference: OLP lib/providers/anthropic.mjs anthropicStreamJsonEventToIR (commit 97e7d16).
 //
 // @param {object} event — parsed NDJSON event
-// @param {boolean} isFirstDelta — true if no content has been yielded yet
-function parseStreamJsonEvent(event, isFirstDelta) {
+// @param {boolean} sawTextDelta — true if a streaming content_block_delta text was already seen
+function parseStreamJsonEvent(event, sawTextDelta) {
   const t = event?.type;
 
   // system/* — first-event init + other system meta (api_retry etc.)
@@ -258,19 +284,23 @@ function parseStreamJsonEvent(event, isFirstDelta) {
   if (t === "stream_event") {
     const inner = event.event ?? event;
     if (inner?.type === "content_block_delta" && inner.delta?.type === "text_delta") {
-      return { text: inner.delta.text ?? "" };
+      return { text: inner.delta.text ?? "", fromDelta: true };
     }
     // Other stream_event sub-types (content_block_start, message_delta, etc.) — consumed
     return null;
   }
 
-  // assistant — aggregate message (fallback when no prior content_block_delta seen)
-  // Empirically (claude CLI without --include-partial-messages, verified v2.1.104 through v2.1.158): fast/short
-  // responses may emit ONLY the aggregate assistant event, no content_block_delta events.
-  // If isFirstDelta is true, extract text here; otherwise it's a duplicate, ignore.
+  // assistant — aggregate message. claude CLI without --include-partial-messages emits NO
+  // content_block_delta events; each assistant message arrives as its own aggregate `assistant`
+  // event. An agentic/tool-using turn has SEVERAL (preamble + one per tool round + final answer),
+  // so we must accumulate the text of EVERY such event. The prior `isFirstDelta` guard kept only
+  // the FIRST message's text and dropped the rest — silently losing the post-tool-use final answer
+  // on every tool-using turn (verified v2.1.104 through v2.1.211; see PR body capture).
+  // The only real hazard is the delta+aggregate DOUBLE-COUNT: if streaming deltas were already
+  // seen (sawTextDelta), the aggregate duplicates them — ignore it.
   // Reference: OLP commit 65f945c (assistant-aggregate fallback, fold-in).
   if (t === "assistant") {
-    if (isFirstDelta) {
+    if (!sawTextDelta) {
       const blocks = event.message?.content;
       if (Array.isArray(blocks)) {
         const text = blocks
@@ -324,6 +354,16 @@ const ALLOWED_TOOLS = (process.env.CLAUDE_ALLOWED_TOOLS ||
   "Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch,Agent"
 ).split(",").map(s => s.trim()).filter(Boolean);
 const SYSTEM_PROMPT = process.env.CLAUDE_SYSTEM_PROMPT || "";
+// Max attempts (initial + retries) to coerce a valid structured-output (OpenAI response_format)
+// JSON response out of the model before rejecting. See runStructuredCompletion.
+// Fail closed on a non-numeric value via resolveMaxAttempts(): the old `Math.max(1, parseInt("abc",10))`
+// === `Math.max(1, NaN)` === NaN, which made the retry loop `attempt < NaN` never execute → 0 spawns,
+// every structured request silently refused. The helper rejects NaN/non-finite/<1 and keeps the
+// documented default of 3. (PR #153 review round 2, NaN-guard must-fix.)
+const STRUCTURED_MAX_ATTEMPTS = resolveMaxAttempts(
+  process.env.OCP_STRUCTURED_MAX_ATTEMPTS,
+  { fallback: 3, warn: (m) => console.warn(`[init] ${m}`) },
+);
 const MCP_CONFIG = process.env.CLAUDE_MCP_CONFIG || "";
 let SESSION_TTL = parseInt(process.env.CLAUDE_SESSION_TTL || "3600000", 10);
 let MAX_CONCURRENT = parseInt(process.env.CLAUDE_MAX_CONCURRENT || "8", 10);
@@ -343,6 +383,19 @@ const BREAKER_HALF_OPEN_MAX = parseInt(process.env.CLAUDE_BREAKER_HALF_OPEN_MAX 
 const HEARTBEAT_INTERVAL = parseInt(process.env.CLAUDE_HEARTBEAT_INTERVAL || "0", 10);
 const BIND_ADDRESS = process.env.CLAUDE_BIND || "127.0.0.1";
 const NO_CONTEXT = process.env.CLAUDE_NO_CONTEXT === "true";
+// Config epoch for the response cache (issue #176). The cache key hashes model + messages +
+// sampling params, but the ANSWER also depends on boot-time server config that shapes the
+// composed prompt / tool surface: the operator system prompt (#175), the OCP wrapper text,
+// the allowed-tools set, and NO_CONTEXT. The cache store is SQLite-backed and survives
+// restarts, so without this an operator who changes any of these and restarts keeps serving
+// answers composed under the OLD config until TTL expiry. Folding a digest of the four into
+// every cache key makes any change an instant, whole-cache invalidation — the honest behavior.
+// Deliberately boot-time-only: runtime-mutable settings (e.g. maxPromptChars via the settings
+// API) are excluded because a const epoch cannot track them; truncation also only drops
+// context rather than changing the instruction set.
+const CONFIG_EPOCH = cryptoCreateHash("sha256")
+  .update(JSON.stringify([SYSTEM_PROMPT, SYSTEM_PROMPT_WRAPPER, ALLOWED_TOOLS, NO_CONTEXT]))
+  .digest("hex").slice(0, 16);
 // Kill-switch for the FIX-③ default-path spawn-home isolation (see resolveSpawnHome /
 // spawnHomeMode below). When "1", the -p/stream-json spawn always runs in the operator's
 // real HOME with no cwd override — byte-for-byte the pre-isolation behaviour — even if an
@@ -779,6 +832,21 @@ if (TUI_MODE && PROXY_ANONYMOUS_KEY) {
   process.exit(1);
 }
 
+// OCP_LOCAL_TOOLS safety gate (mirrors the OCP_TUI_FULL_TOOLS model, ADR 0007): the positive
+// "you may use local tools" system-prompt wrapper is single-user only, so refuse to boot if it
+// could reach an untrusted caller. Fail-closed on multi-tenant auth, a non-loopback bind, or an
+// anonymous key. The pure predicate lives in lib/prompt.mjs (unit-tested); the exit stays here.
+const _localToolsBootError = localToolsSafetyError({
+  enabled: LOCAL_TOOLS_ACTIVE,
+  authMode: AUTH_MODE,
+  loopbackBind: isLoopbackBind(BIND_ADDRESS),
+  anonymousKey: !!PROXY_ANONYMOUS_KEY,
+});
+if (_localToolsBootError) {
+  console.error(`FATAL: ${_localToolsBootError}\n  See README § "Environment Variables" (OCP_LOCAL_TOOLS) and docs/adr/0007-tui-interactive-mode.md. Refusing to start.`);
+  process.exit(1);
+}
+
 if (PROXY_ANONYMOUS_KEY && AUTH_MODE !== "multi") {
   console.warn("WARNING: PROXY_ANONYMOUS_KEY is set but AUTH_MODE is not 'multi' — anonymous key will be ignored");
 }
@@ -1084,7 +1152,7 @@ const authCheckInterval = setInterval(checkAuth, 600000);
 // CLAUDE_SYSTEM_PROMPT env var is absorbed into the system prompt via
 // extractSystemPrompt() at the caller level; APPEND_SYSTEM_PROMPT no longer used.
 // Note: ALLOWED_TOOLS / SKIP_PERMISSIONS / MCP_CONFIG are preserved as before.
-function buildCliArgs(cliModel, systemPromptFile) {
+function buildCliArgs(cliModel, systemPromptFile, opts = {}) {
   const args = [
     "--model", cliModel,
     "--output-format", "stream-json",
@@ -1092,6 +1160,14 @@ function buildCliArgs(cliModel, systemPromptFile) {
     "--no-session-persistence",
     "--system-prompt-file", systemPromptFile,
   ];
+
+  // Multimodal path (issue #110): images are fed as Anthropic content blocks over
+  // a stream-json stdin stream. `--input-format stream-json` (§ --input-format,
+  // choices text|stream-json; realtime streaming input) is added ONLY when the
+  // request carries an image part; the default (text) input path is untouched.
+  if (opts.streamJsonInput) {
+    args.push("--input-format", "stream-json");
+  }
 
   // Permissions
   // ADR 0007 B-path: in multi-tenant mode, suppress operator-FS tools so a guest
@@ -1141,11 +1217,45 @@ function buildCliArgs(cliModel, systemPromptFile) {
   return args;
 }
 
+// Thin env wrapper over parsePositiveInt (lib/env.mjs): resolve `name` from the
+// environment fail-closed, warning on a present-but-invalid value. Keeps the pure
+// parse in a unit-testable module. (PR #154 review F3)
+function parseIntEnv(name, def) {
+  const { value, ok } = parsePositiveInt(process.env[name], def);
+  if (!ok) console.warn(`⚠ ${name}="${process.env[name]}" is not a valid positive integer (bytes/count, no unit suffix); ignoring and using default ${def}.`);
+  return value;
+}
+
 // ── Format messages to prompt text ──────────────────────────────────────
 // Truncation guard: if total chars exceed MAX_PROMPT_CHARS, keep the system
 // message(s) + first user message + last N messages, dropping the middle.
 // This prevents runaway context from gateway-side conversation accumulation.
-let MAX_PROMPT_CHARS = parseInt(process.env.CLAUDE_MAX_PROMPT_CHARS || "150000", 10);
+// Routed through parseIntEnv so a misconfigured cap fails CLOSED to the default rather than
+// NaN — CLAUDE_MAX_PROMPT_CHARS=unlimited previously → NaN → enforceTextBudget's `!(NaN > 0)`
+// early-return → 500k chars passed unbounded, silently defeating F2's text-budget guarantee
+// (PR #154 round 2, gap (a)). The default itself is SPOT-DERIVED (ADR 0009, PR #179):
+// max(models.json contextWindow) × 3 chars/token — currently 600,000 — so the two fixes
+// compose: parseIntEnv guards a SET-but-garbage value, the derivation supplies the honest
+// default when unset/empty. `let` is kept for the settings API.
+let MAX_PROMPT_CHARS = parseIntEnv("CLAUDE_MAX_PROMPT_CHARS", derivePromptCharBudget(modelsConfig.models));
+
+// ── Multimodal image caps (issue #110) ──────────────────────────────────
+// OpenAI `image_url` parts are forwarded to claude as Anthropic image blocks via
+// `--input-format stream-json`. Images deliberately BYPASS the text char budget
+// (MAX_PROMPT_CHARS) — they are bounded by these byte/count caps instead, and by
+// MAX_BODY_SIZE at the HTTP layer. Data URIs are supported by default; remote
+// http(s) image URLs are OFF unless CLAUDE_IMAGE_ALLOW_URL is set (v1: data URIs
+// only). See docs/adr/0006-openai-shim-scope.md (Class B.1) and README § "Images".
+const IMAGE_ALLOW_URL = /^(1|true|yes|on)$/i.test(process.env.CLAUDE_IMAGE_ALLOW_URL || "");
+const MAX_IMAGE_BYTES = parseIntEnv("CLAUDE_MAX_IMAGE_BYTES", 5 * 1024 * 1024);
+const MAX_IMAGES = parseIntEnv("CLAUDE_MAX_IMAGES", 20);
+const MAX_IMAGE_TOTAL_BYTES = parseIntEnv("CLAUDE_MAX_IMAGE_TOTAL_BYTES", 20 * 1024 * 1024);
+const MULTIMODAL_OPTS = {
+  allowRemoteUrl: IMAGE_ALLOW_URL,
+  maxImageBytes: MAX_IMAGE_BYTES,
+  maxImages: MAX_IMAGES,
+  maxTotalImageBytes: MAX_IMAGE_TOTAL_BYTES,
+};
 
 // Flatten OpenAI content (string | array of parts) to plain text for the prompt.
 // Array content: concatenate text parts; replace non-text parts (e.g. image_url)
@@ -1237,9 +1347,6 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
 
   // Circuit breaker: disabled (see comment at top of breaker section)
 
-  stats.activeRequests++;
-  stats.totalRequests++;
-
   // Phase 6c: always serialize full conversation via stdin (no session resume).
   // System messages are extracted and passed via --system-prompt-file; the remaining
   // messages (user/assistant/tool) are serialized by messagesToPrompt.
@@ -1248,22 +1355,53 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   // messagesToPrompt skips system messages now that they go via --system-prompt-file.
   // Filter them out before calling to avoid double-injection.
   const nonSystemMessages = messages.filter(m => m.role !== "system");
-  const prompt = messagesToPrompt(nonSystemMessages);
 
+  // Multimodal (issue #110): when any message carries an OpenAI image_url part,
+  // feed the conversation as Anthropic content blocks over --input-format
+  // stream-json (images preserved and kept OUT of the text char budget).
+  // Otherwise the text path is byte-for-byte unchanged. buildStreamJsonInput may
+  // throw MultimodalError on an invalid/oversized image; it runs BEFORE any stats
+  // mutation so a validation failure never leaks counters or the concurrency slot
+  // (handleChatCompletions validates first, so in practice it will not throw here).
+  const useStreamJson = hasImageContent(nonSystemMessages);
+  let stdinPayload, promptChars;
+  if (useStreamJson) {
+    // Pass MAX_PROMPT_CHARS so the multimodal text is bounded by the same
+    // runaway-context guard as the text path (PR #154 review F2). Images bypass it.
+    const built = buildStreamJsonInput(nonSystemMessages, { ...MULTIMODAL_OPTS, maxTextChars: MAX_PROMPT_CHARS });
+    stdinPayload = built.payload;
+    promptChars = built.stats.textChars;
+    if (built.stats.truncated) {
+      logEvent("warn", "prompt_truncated", {
+        originalChars: built.stats.originalTextChars,
+        maxChars: MAX_PROMPT_CHARS,
+        keptChars: built.stats.textChars,
+        path: "multimodal",
+      });
+    }
+  } else {
+    stdinPayload = messagesToPrompt(nonSystemMessages);
+    promptChars = stdinPayload.length;
+  }
+
+  stats.totalRequests++;
   stats.oneOffRequests++;
   if (conversationId) {
-    console.log(`[session] stateless conv=${conversationId.slice(0, 12)}... key=${keyName || "anon"} msgs=${messages.length} prompt_chars=${prompt.length}`);
+    console.log(`[session] stateless conv=${conversationId.slice(0, 12)}... key=${keyName || "anon"} msgs=${messages.length} prompt_chars=${promptChars}`);
   }
 
   // System prompt goes via a temp file, not argv: MAX_PROMPT_CHARS (below/via env) bounds the
   // conversation but was never applied to systemPrompt itself, so a large enough system prompt
   // (e.g. cognee's GRAPH_COMPLETION synthesis, which embeds retrieved graph context) overflows
   // the OS argv+environ limit and spawn() fails with "spawn E2BIG". A file path has no such
-  // ceiling regardless of content size. Removed in cleanup() below on every exit path.
+  // ceiling regardless of content size. Removed in cleanup() below on every exit path. Written
+  // 0o600 (owner-only): the file can carry retrieved context that shouldn't be world-readable
+  // on a shared host (security review, 2026-07-28) -- mode is honored because this path is
+  // always freshly created (unique randomUUID() name), never an overwrite.
   const systemPromptFile = join(tmpdir(), `ocp-sysprompt-${randomUUID()}.txt`);
-  writeFileSync(systemPromptFile, systemPrompt, "utf8");
+  writeFileSync(systemPromptFile, systemPrompt, { encoding: "utf8", mode: 0o600 });
 
-  const cliArgs = buildCliArgs(cliModel, systemPromptFile);
+  const cliArgs = buildCliArgs(cliModel, systemPromptFile, { streamJsonInput: useStreamJson });
 
   const env = { ...process.env };
   delete env.CLAUDECODE;
@@ -1299,6 +1437,17 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
 
   const proc = spawn(CLAUDE, cliArgs, spawnOpts);
   activeProcesses.add(proc);
+  // Counter drift (#180, reported by @konceptnet): increment ONLY after the spawn has
+  // succeeded and the process is registered. Incrementing before the spawn (as this did) leaked
+  // +1 permanently on any synchronous throw in between — buildCliArgs, env assembly, the spawn
+  // decision, or spawn() itself — because nothing was yet attached that could undo it.
+  //
+  // cleanup() is the SOLE decrement site, but note how it is reached: only 'exit' is wired HERE
+  // (below); 'close' and 'error' are wired by each CALLER (callClaude / callClaudeStreaming).
+  // That caller wiring is REQUIRED, not belt-and-braces — a FAILED spawn emits 'error' and
+  // 'close' but never 'exit', so without it a spawn failure would never decrement. A future
+  // third caller of spawnClaudeProcess must wire them too.
+  stats.activeRequests++;
 
   const t0 = Date.now();
   let gotFirstByte = false;
@@ -1352,12 +1501,13 @@ function spawnClaudeProcess(model, messages, conversationId, keyName, releaseSlo
   // the spawned process, NOT on the stdin Writable — it does not catch this.
   proc.stdin.on("error", (e) => logEvent("warn", "stdin_write_error", { error: e.message }));
 
-  // Write prompt to stdin immediately
-  proc.stdin.write(prompt);
+  // Write the serialized turn to stdin immediately. Text path: the flat prompt.
+  // Multimodal path: a single newline-terminated stream-json user envelope.
+  proc.stdin.write(stdinPayload);
   proc.stdin.end();
 
-  recordModelRequest(cliModel, prompt.length);
-  logEvent("info", "claude_spawned", { model: cliModel, promptChars: prompt.length, systemPromptChars: systemPrompt.length, timeout: TIMEOUT, tier: getModelTier(cliModel), session: conversationId ? conversationId.slice(0, 12) + "..." : "none" });
+  recordModelRequest(cliModel, promptChars);
+  logEvent("info", "claude_spawned", { model: cliModel, promptChars, systemPromptChars: systemPrompt.length, inputFormat: useStreamJson ? "stream-json" : "text", timeout: TIMEOUT, tier: getModelTier(cliModel), session: conversationId ? conversationId.slice(0, 12) + "..." : "none" });
 
   // Single request timeout — no separate first-byte timer.
   // Claude tool-use causes long pauses in the token stream (30s-5min),
@@ -1427,7 +1577,7 @@ async function callClaude(model, messages, conversationId, keyName, res) {
     const { proc, cliModel, conversationId: convId, t0, cleanup, handleSessionFailure, markFirstByte } = ctx;
     let lineBuffer = "";
     let assembledText = "";
-    let isFirstDelta = true;
+    let sawTextDelta = false;
     let resultEventSeen = false;
     let stderr = "";
 
@@ -1437,11 +1587,18 @@ async function callClaude(model, messages, conversationId, keyName, res) {
       const { events, remainder } = parseStreamJsonLines(lineBuffer);
       lineBuffer = remainder;
       for (const event of events) {
-        const parsed = parseStreamJsonEvent(event, isFirstDelta);
+        const parsed = parseStreamJsonEvent(event, sawTextDelta);
         if (!parsed) continue;
         if (parsed.text !== undefined) {
-          assembledText += parsed.text;
-          isFirstDelta = false;
+          if (parsed.fromDelta) {
+            assembledText += parsed.text;
+            sawTextDelta = true;
+          } else {
+            // aggregate assistant message — separate successive messages so the preamble and
+            // the post-tool-use final answer don't run together.
+            if (assembledText && !assembledText.endsWith("\n")) assembledText += "\n\n";
+            assembledText += parsed.text;
+          }
         } else if (parsed.stop) {
           resultEventSeen = true;
         } else if (parsed.error) {
@@ -1888,9 +2045,10 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
   let stderr = "";
   let headersSent = false;
   let totalChars = 0;
+  let streamEndsWithNewline = false; // tracks whether emitted text ends in "\n" — see the separator guard below
   let cachedContent = ""; // accumulate for cache write-back
   let lineBuffer = "";
-  let isFirstDelta = true;
+  let sawTextDelta = false;
   let resultEventSeen = false;
   // Separate flag for is_error result — must NOT be conflated with resultEventSeen.
   // If errored===true the close handler must not cache the response or record success
@@ -1927,15 +2085,26 @@ async function callClaudeStreaming(model, messages, conversationId, res, authInf
     lineBuffer = remainder;
 
     for (const event of events) {
-      const parsed = parseStreamJsonEvent(event, isFirstDelta);
+      const parsed = parseStreamJsonEvent(event, sawTextDelta);
       if (!parsed) continue;
 
       if (parsed.text !== undefined) {
-        // content_block_delta text — forward as SSE delta
-        const text = parsed.text;
+        // Streamed delta, or an aggregate assistant-message text (agentic turns emit several).
+        // For an aggregate message after earlier text, prepend a separator so the preamble and
+        // the post-tool-use final answer don't run together in the forwarded stream.
+        let text = parsed.text;
+        if (parsed.fromDelta) {
+          sawTextDelta = true;
+        } else if (totalChars > 0 && !streamEndsWithNewline) {
+          // Mirror the buffered path's guard (assembledText.endsWith("\n")): only inject the
+          // blank-line separator when the already-emitted text doesn't already end in a newline,
+          // so a message ending in "\n" doesn't produce a triple newline here while the buffered
+          // path produces a single. Keeps the two assembly paths byte-identical. (PR #183 review.)
+          text = "\n\n" + text;
+        }
+        streamEndsWithNewline = text.endsWith("\n");
         totalChars += text.length;
         if (CACHE_TTL > 0) cachedContent += text;
-        isFirstDelta = false;
 
         if (!ensureHeaders()) continue;
         sendSSE(res, {
@@ -2103,6 +2272,31 @@ function completionResponse(res, id, model, content) {
     choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   });
+}
+
+// OpenAI's designated mechanism for "the model would not produce the required output" is the
+// assistant `refusal` field (content:null, refusal:<text>, finish_reason:"stop") — NOT an invented
+// error type. Structured-output exhaustion emits this so SDK clients take their written `refusal`
+// branch instead of throwing an opaque UnprocessableEntityError. (PR #153 review, finding 3.)
+function refusalResponse(res, id, model, refusal) {
+  jsonResponse(res, 200, {
+    id, object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, message: { role: "assistant", content: null, refusal }, finish_reason: "stop" }],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  });
+}
+
+// Streaming form of refusalResponse: a role chunk, a `refusal` delta, then the stop chunk.
+function streamRefusalAsSSE(res, id, model, refusal) {
+  const created = Math.floor(Date.now() / 1000);
+  res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no" });
+  sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+  sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { refusal }, finish_reason: null }] });
+  sendSSE(res, { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+  res.write("data: [DONE]\n\n");
+  res.end();
 }
 
 // Replay a complete string as a chunked SSE stream (80 codepoints/chunk).
@@ -2606,10 +2800,50 @@ async function handleSettings(req, res) {
 }
 
 // ── Handle chat completions ─────────────────────────────────────────────
-const MAX_BODY_SIZE = 5 * 1024 * 1024; // 5 MB
+// Default 5 MB, byte-for-byte unchanged unless CLAUDE_MAX_BODY_SIZE is set. Base64
+// image payloads inflate ~33%; operators enabling large images (issue #110) can
+// raise this to admit bigger requests. Parsed fail-closed (PR #154 review F3): a
+// bad value (`unlimited` → NaN, `5MB` → 5) must not disable the body cap or brick
+// the proxy — parseIntEnv keeps the 5 MB default and warns instead.
+const MAX_BODY_SIZE = parseIntEnv("CLAUDE_MAX_BODY_SIZE", 5 * 1024 * 1024);
+const MAX_BODY_SIZE_LABEL = `${Math.round(MAX_BODY_SIZE / (1024 * 1024))}MB`;
 
 // Set of all valid model identifiers (canonical IDs + aliases)
 const VALID_MODELS = new Set(Object.keys(MODEL_MAP));
+
+// Drive the model to a valid structured-output (OpenAI response_format) JSON string, retrying up to
+// STRUCTURED_MAX_ATTEMPTS. Appends a strict JSON-only steering instruction, extracts + validates the
+// reply (pure helpers in lib/structured-output.mjs), and escalates the instruction on failure.
+// Returns the canonical JSON string (message.content) or throws StructuredOutputError.
+async function runStructuredCompletion(upstreamCall, model, messages, conversationId, keyName, res, structured) {
+  let lastErr = "no valid JSON produced";
+  let lastRaw = "";
+  for (let attempt = 0; attempt < STRUCTURED_MAX_ATTEMPTS; attempt++) {
+    const augmented = [...messages, { role: "system", content: structuredSystemInstruction(structured, attempt, lastErr) }];
+    const raw = await upstreamCall(model, augmented, conversationId, keyName, res);
+    lastRaw = raw;
+    const extracted = extractJsonPayload(raw, { whole: structured.mode === "json_object" });
+    if (!extracted.ok) {
+      lastErr = extracted.reason || "response was not parseable as JSON";
+      logEvent("warn", "structured_retry", { attempt, reason: extracted.reason || "unparseable" });
+      continue;
+    }
+    if (structured.mode === "schema" && structured.schema) {
+      // validateJsonSchemaSafe (#181): a pathologically deep model reply overflows the value-depth
+      // recursion; the safe façade turns that into a validation miss (→ retry → refusal) instead of
+      // a caught RangeError surfacing as a generic 500.
+      const errs = validateJsonSchemaSafe(extracted.value, structured.schema, "$", structured.strict);
+      if (errs.length) {
+        lastErr = "schema validation failed: " + errs.slice(0, 5).join("; ");
+        logEvent("warn", "structured_retry", { attempt, reason: "schema", errors: errs.slice(0, 5) });
+        continue;
+      }
+    }
+    if (attempt > 0) logEvent("info", "structured_recovered", { attempt });
+    return JSON.stringify(extracted.value); // canonical, fence-free, prose-free
+  }
+  throw new StructuredOutputError(lastErr, lastRaw);
+}
 
 async function handleChatCompletions(req, res) {
   let body = "";
@@ -2617,7 +2851,7 @@ async function handleChatCompletions(req, res) {
     for await (const chunk of req) {
       body += chunk;
       if (body.length > MAX_BODY_SIZE) {
-        return jsonResponse(res, 413, { error: { message: "Request body too large (max 5MB)", type: "invalid_request_error" } });
+        return jsonResponse(res, 413, { error: { message: `Request body too large (max ${MAX_BODY_SIZE_LABEL})`, type: "invalid_request_error" } });
       }
     }
   } catch (e) {
@@ -2632,6 +2866,20 @@ async function handleChatCompletions(req, res) {
 
   const messages = parsed.messages || parsed.input || [{ role: "user", content: parsed.prompt || "" }];
   const model = parsed.model || modelsConfig.aliases.sonnet;
+  // Cache keys must hash the RESOLVED model, never the string the client happened to use.
+  // `model` is whatever was sent — a canonical id, an alias ("opus"), or a legacyAlias
+  // ("claude-opus-4"). MODEL_MAP carries all three, and models.json is read once at boot, so
+  // repointing an alias only takes effect on restart — while the SQLite response_cache outlives
+  // it. Hashing the raw string would therefore keep serving the OLD model's answers under that
+  // alias until TTL expiry, silently defeating the repoint (the #176 hazard, for aliases).
+  // Resolving first also means "opus" and "claude-opus-5" correctly share one slot: identical
+  // spawn, identical answer. Only the cache KEY is resolved — `model` is still echoed back to
+  // the client verbatim, so the wire response is unchanged.
+  // hasOwn, not a bare lookup: MODEL_MAP is a plain object, so `MODEL_MAP["constructor"]`
+  // would return an inherited FUNCTION. Unreachable today (the VALID_MODELS gate below 400s
+  // first, and it is built from Object.keys so it holds only own keys), but a bare lookup
+  // would hand cacheHash a function the day anyone widens that gate or moves this binding.
+  const cacheModel = Object.hasOwn(MODEL_MAP, model) ? MODEL_MAP[model] : model;
   const stream = parsed.stream;
 
   // Validate model against known models
@@ -2644,6 +2892,57 @@ async function handleChatCompletions(req, res) {
 
   if (!Array.isArray(messages) || messages.length === 0) {
     return jsonResponse(res, 400, { error: { message: "'messages' must be a non-empty array", type: "invalid_request_error" } });
+  }
+
+  // Multimodal validation (issue #110): when a request carries OpenAI `image_url`
+  // content parts, validate/parse them now so an invalid, unsupported, or oversized
+  // image returns a clean 4xx BEFORE the cache/spawn path (rather than a silent drop
+  // or an opaque 500). The stream-json transform itself runs at spawn time
+  // (spawnClaudeProcess → buildStreamJsonInput). Class B.1: authorized by ADR 0006;
+  // request shape per OpenAI vision spec (image_url content parts). buildImageBlocks
+  // validates without stringifying, so this early pass is cheap.
+  if (hasImageContent(messages)) {
+    // F1 (PR #154 review): the TUI path (callClaudeTui → messagesToPrompt) cannot
+    // carry image blocks — it renders every non-text part as "[non-text content
+    // omitted]". Forwarding here would let the model answer about an image it never
+    // saw and return 200, which is strictly worse than an honest error (the one
+    // outcome ALIGNMENT.md forbids: silently serving text the model did not mean).
+    // Stream-json image input requires the `claude -p` path, so in TUI_MODE we fail
+    // loudly instead of dropping. Documented in README § "Images".
+    if (TUI_MODE) {
+      return jsonResponse(res, 400, {
+        error: {
+          message: "Image inputs are not supported in TUI mode (CLAUDE_TUI_MODE=true). Images require the default -p spawn path; remove images or run OCP without TUI mode.",
+          type: "invalid_request_error",
+          code: "images_unsupported_in_tui_mode",
+        },
+      });
+    }
+    // Detection runs on the FULL message list, but extraction/spawn drop system messages
+    // (system role carries no image blocks to the CLI). So an image present ONLY in a
+    // system message would be detected as multimodal, survive no filter, fall to the text
+    // path, and render as "[non-text content omitted]" → 200 with a hallucinated answer —
+    // the exact silent-drop this guard exists to forbid. Fail loudly instead. OpenAI
+    // disallows images in the system role anyway, so no legitimate request is rejected.
+    // (PR #154 review round 2, gap (b).)
+    const nonSystem = messages.filter(m => m.role !== "system");
+    if (!hasImageContent(nonSystem)) {
+      return jsonResponse(res, 400, {
+        error: {
+          message: "Image inputs are only supported in user/assistant messages, not in system messages. Move the image_url part to a user message.",
+          type: "invalid_request_error",
+          code: "images_unsupported_in_system_messages",
+        },
+      });
+    }
+    try {
+      buildImageBlocks(nonSystem, { ...MULTIMODAL_OPTS, maxTextChars: MAX_PROMPT_CHARS });
+    } catch (e) {
+      if (e instanceof MultimodalError) {
+        return jsonResponse(res, e.status, { error: { message: e.message, type: e.type, code: e.code } });
+      }
+      throw e;
+    }
   }
 
   // NOTE: quota is best-effort / eventually-consistent. The gate reads the recorded count
@@ -2667,6 +2966,86 @@ async function handleChatCompletions(req, res) {
     }
   }
 
+  // Structured output (OpenAI response_format / json_mode): its own path — the response must be
+  // schema-valid JSON, so it never shares the conversational cache slot. When caching is enabled it
+  // uses a structured-keyed hash (isolated via cacheHash's `structured` marker) and writes back ONLY
+  // a validated result (never a 422). Always validates on a miss.
+  const structured = detectStructuredOutput(parsed);
+  if (structured) {
+    const t0s = Date.now();
+    const promptCharsS = messages.reduce((a, m) => a + contentToText(m.content).length, 0);
+    let structuredHash = null;
+    // DO NOT collapse this with `dedupKey` below (#200). The two cacheHash calls take IDENTICAL
+    // arguments and look like obvious duplicate work — they are not interchangeable, because
+    // their GUARDS differ: this one additionally requires CACHE_TTL > 0. CLAUDE_CACHE_TTL
+    // DEFAULTS TO 0, so in the default configuration structuredHash is null while dedupKey must
+    // still be computed — it drives #153's single-flight stampede protection, which is
+    // deliberately independent of whether response caching is on. `dedupKey = structuredHash`
+    // would therefore silently disable stampede protection by default, in exactly the
+    // concurrent-AI-Task case it exists to bound. The duplicate call is the honest price of the
+    // asymmetry. If you do deduplicate it, compute once under the WEAKER guard and derive the
+    // cache lookup under the stronger one — and add a stampede test before you do.
+    if (CACHE_TTL > 0 && !conversationId && !hasCacheControl(messages)) {
+      structuredHash = cacheHash(cacheModel, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, structured, configEpoch: CONFIG_EPOCH });
+      try {
+        const cached = getCachedResponse(structuredHash, CACHE_TTL);
+        if (cached) {
+          logEvent("info", "cache_hit", { model, hash: structuredHash.slice(0, 12), hits: cached.hits, structured: true });
+          const id = `chatcmpl-${randomUUID()}`;
+          if (stream) streamStringAsSSE(res, id, model, cached.response);
+          else completionResponse(res, id, model, cached.response);
+          return;
+        }
+      } catch (e) { logEvent("error", "cache_check_failed", { error: e.message }); }
+    }
+    const upstreamCall = TUI_MODE ? callClaudeTui : callClaude;
+    // Stampede protection (PR #153 review, finding 5): a structured request can cost up to
+    // STRUCTURED_MAX_ATTEMPTS metered spawns, so N identical concurrent requests (Home Assistant
+    // firing several AI Tasks at once) must NOT each pay N× — they share one flight. We dedup every
+    // one-off structured request (not stateful sessions / client-side prompt caching), independent of
+    // whether OCP response caching is enabled; when caching IS on, the same key gates cache read/write.
+    // Note the guard here is deliberately WEAKER than structuredHash's — no CACHE_TTL check. See the
+    // do-not-collapse comment above (#200).
+    const dedupKey = (!conversationId && !hasCacheControl(messages))
+      ? cacheHash(cacheModel, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, structured, configEpoch: CONFIG_EPOCH })
+      : null;
+    const runStructured = async () => {
+      const c = await runStructuredCompletion(upstreamCall, model, messages, conversationId, req._authKeyName, res, structured);
+      if (structuredHash) { try { setCachedResponse(structuredHash, model, c); } catch (e) { logEvent("error", "cache_write_failed", { error: e.message }); } }
+      return c;
+    };
+    try {
+      const content = dedupKey
+        ? await singleflight(dedupKey, async () => {
+            // A follower that raced in after the leader populated the cache re-reads it here.
+            if (structuredHash) { const rc = getCachedResponse(structuredHash, CACHE_TTL); if (rc) return rc.response; }
+            return runStructured();
+          }, (err) => err instanceof RequestDisconnectedError && !res.destroyed)
+        : await runStructured();
+      const id = `chatcmpl-${randomUUID()}`;
+      if (stream) streamStringAsSSE(res, id, model, content);
+      else completionResponse(res, id, model, content);
+      try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars: promptCharsS, responseChars: content.length, elapsedMs: Date.now() - t0s, success: true }); } catch (e) { logEvent("error", "usage_record_failed", { error: e.message }); }
+      return;
+    } catch (err) {
+      if (err instanceof RequestDisconnectedError) { try { res.end(); } catch {} return; }
+      try { recordUsage({ keyId: req._authKeyId, keyName: req._authKeyName, model, promptChars: promptCharsS, responseChars: 0, elapsedMs: Date.now() - t0s, success: false }); } catch {}
+      if (res.headersSent || res.writableEnded || res.destroyed) { try { res.end(); } catch {} return; }
+      if (err instanceof StructuredOutputError) {
+        // OpenAI's spec mechanism for "model would not produce the required output" is the assistant
+        // `refusal` field (200, content:null, finish_reason:"stop"), NOT an invented 422 error type —
+        // so SDK clients take their written refusal branch. (PR #153 review, finding 3.)
+        logEvent("warn", "structured_failed", { reason: err.reason });
+        const id = `chatcmpl-${randomUUID()}`;
+        const refusal = `Could not produce a response matching the requested response_format after ${STRUCTURED_MAX_ATTEMPTS} attempts (${sanitizeError(err.reason)}).`;
+        if (stream) streamRefusalAsSSE(res, id, model, refusal);
+        else refusalResponse(res, id, model, refusal);
+        return;
+      }
+      return respondUpstreamError(res, err);
+    }
+  }
+
   // Cache check (only when cache is enabled and no active conversation/session)
   if (CACHE_TTL > 0 && !conversationId) {
     // D2: skip OCP cache entirely when messages carry cache_control annotations;
@@ -2675,8 +3054,9 @@ async function handleChatCompletions(req, res) {
       req._cacheHash = null;
       logEvent("info", "cache_skipped", { reason: "cache_control_present" });
     } else {
-      // D1: include keyId in hash to isolate per-key cache pools (v2 format)
-      const hash = cacheHash(model, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p });
+      // D1: include keyId in hash to isolate per-key cache pools (v2 format).
+      // configEpoch (#176): any boot-config change that shapes answers invalidates the cache.
+      const hash = cacheHash(cacheModel, messages, { keyId: req._authKeyId, temperature: parsed.temperature, max_tokens: parsed.max_tokens, top_p: parsed.top_p, configEpoch: CONFIG_EPOCH });
       req._cacheHash = hash; // store for later write-back
       try {
         const cached = getCachedResponse(hash, CACHE_TTL);
@@ -3321,6 +3701,8 @@ server.listen(PORT, BIND_ADDRESS, () => {
   console.log(`Auth: ${PROXY_API_KEY ? "enabled (PROXY_API_KEY set)" : "disabled (no PROXY_API_KEY)"}`);
   console.log(`Auth mode: ${AUTH_MODE}${AUTH_MODE === "shared" ? " (PROXY_API_KEY)" : AUTH_MODE === "multi" ? " (per-user keys)" : " (open)"}`);
   console.log(`Bind: ${BIND_ADDRESS}${BIND_ADDRESS === "0.0.0.0" ? " ⚠ LAN-accessible" : ""}`);
+  if (LOCAL_TOOLS_ACTIVE) console.log(`Local tools: ON (OCP_LOCAL_TOOLS=1) — model told it may use local tools; single-user/loopback only`);
+  else if (LOCAL_TOOLS) console.warn(`⚠ OCP_LOCAL_TOOLS=1 is ignored in TUI mode (the -p system-prompt wrapper is not used). The TUI tool surface is governed by OCP_TUI_FULL_TOOLS.`);
   if (NO_CONTEXT) console.log(`Context: suppressed (CLAUDE_NO_CONTEXT=true — no CLAUDE.md, no auto-memory)`);
   if (CACHE_TTL > 0) console.log(`Cache: enabled (TTL=${CACHE_TTL / 1000}s)`);
   else console.log(`Cache: disabled (set CLAUDE_CACHE_TTL to enable)`);

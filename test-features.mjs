@@ -204,6 +204,23 @@ test("cacheHash includes temperature in hash", () => {
   assert.notEqual(h2, h3);
 });
 
+// ── configEpoch (#176): a boot-config change must invalidate the persistent cache ──
+// Mutation-proof: drop the `ce:` fold in keys.mjs and the first test goes green-to-red.
+test("cacheHash: different configEpoch → different key (config change invalidates)", () => {
+  const h1 = cacheHash("sonnet", msgs1, { configEpoch: "aaaa000011112222" });
+  const h2 = cacheHash("sonnet", msgs1, { configEpoch: "bbbb000011112222" });
+  assert.notEqual(h1, h2);
+});
+
+test("cacheHash: same configEpoch is stable; absent epoch hashes byte-identically to pre-#176", () => {
+  const e1 = cacheHash("sonnet", msgs1, { configEpoch: "aaaa000011112222" });
+  const e2 = cacheHash("sonnet", msgs1, { configEpoch: "aaaa000011112222" });
+  assert.equal(e1, e2);
+  // absent-epoch calls (older callers, all pre-existing tests) must not change behavior
+  assert.equal(cacheHash("sonnet", msgs1, {}), cacheHash("sonnet", msgs1));
+  assert.notEqual(e1, cacheHash("sonnet", msgs1), "epoch-carrying key differs from legacy key");
+});
+
 test("cacheHash includes max_tokens in hash", () => {
   const h1 = cacheHash("sonnet", msgs1, {});
   const h2 = cacheHash("sonnet", msgs1, { max_tokens: 100 });
@@ -821,10 +838,576 @@ test("doctor falls back to currentVersion when origin/main unreachable (no stale
   assert.equal(result.next_action.kind, "noop");
 });
 
+// ── System-prompt operator append (CLAUDE_SYSTEM_PROMPT wiring) ─────────────
+// The var was documented + echoed on /health but never reached a request (dead
+// since APPEND_SYSTEM_PROMPT was retired — caught in PR #170 review). The wiring
+// contract lives in lib/prompt.mjs. Mutation-proof: make appendOperatorPrompt
+// return `base` unconditionally and the first test fails; make it stop trimming
+// and the whitespace test fails.
+import { appendOperatorPrompt, derivePromptCharBudget, resolvePromptCharBudget, selectPromptWrapper, localToolsSafetyError } from "./lib/prompt.mjs";
+
+console.log("\nPrompt-char budget (ADR 0009 — SPOT-derived):");
+
+// Mutation-proof: drop the ×charsPerToken and the first test fails; drop the
+// Math.max floor guard and the floor tests fail; use min() instead of max() over
+// windows and the largest-window test fails.
+test("derivePromptCharBudget: LARGEST contextWindow × 3 chars/token", () => {
+  const models = [{ contextWindow: 200000 }, { contextWindow: 100000 }];
+  assert.equal(derivePromptCharBudget(models), 600000);
+});
+
+test("derivePromptCharBudget: matches the live models.json SPOT (200k → 600k today)", () => {
+  const spot = JSON.parse(tuiReadFileSync(new URL("./models.json", import.meta.url), "utf8"));
+  assert.equal(derivePromptCharBudget(spot.models), 600000);
+});
+
+test("derivePromptCharBudget: floor wins over a tiny/absent window; empty input → floor", () => {
+  assert.equal(derivePromptCharBudget([{ contextWindow: 1000 }]), 150000, "3k chars would truncate everything — floor guards it");
+  assert.equal(derivePromptCharBudget([]), 150000);
+  assert.equal(derivePromptCharBudget(undefined), 150000);
+  assert.equal(derivePromptCharBudget([{ id: "x" }, { contextWindow: "junk" }, { contextWindow: -5 }]), 150000);
+});
+
+test("derivePromptCharBudget: charsPerToken and floor are tunable parameters", () => {
+  assert.equal(derivePromptCharBudget([{ contextWindow: 1000000 }], { charsPerToken: 3 }), 3000000);
+  assert.equal(derivePromptCharBudget([], { floor: 42 }), 42);
+});
+
+// PR #179 review regression: EMPTY env value must mean "use the default" (the old
+// `parseInt(env || "150000")` contract). Mutation-proof: switch the resolver's
+// truthiness check to `!= null` and the empty-string test fails (NaN ≠ 600000).
+test("resolvePromptCharBudget: empty/unset env → SPOT-derived default, never NaN", () => {
+  const models = [{ contextWindow: 200000 }];
+  assert.equal(resolvePromptCharBudget("", models), 600000, "CLAUDE_MAX_PROMPT_CHARS= (empty) must fall back to derived");
+  assert.equal(resolvePromptCharBudget(undefined, models), 600000);
+});
+
+test("resolvePromptCharBudget: a set env value overrides the derivation absolutely", () => {
+  const models = [{ contextWindow: 200000 }];
+  assert.equal(resolvePromptCharBudget("300000", models), 300000);
+  assert.equal(resolvePromptCharBudget("150000", models), 150000, "explicit legacy value wins over the bigger derived default");
+});
+
+console.log("\nSystem-prompt operator append:");
+
+test("appendOperatorPrompt: appends the operator prompt LAST, blank-line separated", () => {
+  assert.equal(appendOperatorPrompt("WRAPPER\n\nclient", "Answer in Chinese."), "WRAPPER\n\nclient\n\nAnswer in Chinese.");
+});
+
+test("appendOperatorPrompt: unset/empty/whitespace-only → base returned BYTE-IDENTICAL", () => {
+  const base = "WRAPPER\n\nclient sys";
+  assert.equal(appendOperatorPrompt(base, undefined), base);
+  assert.equal(appendOperatorPrompt(base, ""), base);
+  assert.equal(appendOperatorPrompt(base, "   \n "), base, "a stray space in a service unit must not inject anything");
+  assert.equal(appendOperatorPrompt(base, null), base);
+});
+
+test("appendOperatorPrompt: operator value is trimmed before appending", () => {
+  assert.equal(appendOperatorPrompt("W", "  hi  "), "W\n\nhi");
+});
+
+// ── OCP_LOCAL_TOOLS wrapper selection + safety gate (lib/prompt.mjs) ──────────
+console.log("\nOCP_LOCAL_TOOLS wrapper + safety gate:");
+
+const NEG = "You do NOT have access to any local filesystem";
+const POS = "you may use your available local tools";
+
+test("selectPromptWrapper: default (disabled) returns the negative wrapper BYTE-IDENTICAL", () => {
+  // Mutation-proof: flip the ternary and the default path leaks the positive wrapper.
+  assert.equal(selectPromptWrapper(false, NEG, POS), NEG);
+});
+
+test("selectPromptWrapper: enabled returns the positive (local-tools) wrapper", () => {
+  assert.equal(selectPromptWrapper(true, NEG, POS), POS);
+});
+
+test("localToolsSafetyError: disabled → null regardless of an otherwise-unsafe deploy", () => {
+  // The gate must not fire when the flag is off — the default path is never blocked.
+  assert.equal(localToolsSafetyError({ enabled: false, authMode: "multi", loopbackBind: false, anonymousKey: true }), null);
+});
+
+test("localToolsSafetyError: enabled on a safe single-user loopback instance → null (boots)", () => {
+  assert.equal(localToolsSafetyError({ enabled: true, authMode: "none", loopbackBind: true, anonymousKey: false }), null);
+  assert.equal(localToolsSafetyError({ enabled: true, authMode: "shared", loopbackBind: true, anonymousKey: false }), null);
+});
+
+test("localToolsSafetyError: enabled + AUTH_MODE=multi → fatal (guest could be told it has FS)", () => {
+  const e = localToolsSafetyError({ enabled: true, authMode: "multi", loopbackBind: true, anonymousKey: false });
+  assert.ok(e && /multi/.test(e), `expected a multi-tenant fatal, got: ${e}`);
+});
+
+test("localToolsSafetyError: enabled + non-loopback bind → fatal (network-exposed)", () => {
+  const e = localToolsSafetyError({ enabled: true, authMode: "none", loopbackBind: false, anonymousKey: false });
+  assert.ok(e && /loopback/.test(e), `expected a loopback fatal, got: ${e}`);
+});
+
+test("localToolsSafetyError: enabled + anonymous key → fatal (unnamed callers)", () => {
+  const e = localToolsSafetyError({ enabled: true, authMode: "none", loopbackBind: true, anonymousKey: true });
+  assert.ok(e && /ANONYMOUS/i.test(e), `expected an anonymous-key fatal, got: ${e}`);
+});
+
+test("localToolsSafetyError: multi is checked before loopback/anon (most severe first)", () => {
+  // A deploy that trips several conditions reports the multi-tenant one — the strongest signal.
+  const e = localToolsSafetyError({ enabled: true, authMode: "multi", loopbackBind: false, anonymousKey: true });
+  assert.ok(/multi/.test(e));
+});
+
+// ── OCP_LOCAL_TOOLS INTEGRATION: boot real server.mjs, observe the -p spawn ──────────
+// The unit tests above prove the pure helpers. These close the INTEGRATION SEAM the suite
+// otherwise can't reach (server.mjs boots a listener on import): a fake `claude` captures the
+// exact --system-prompt OCP spawns it with, so we assert the SELECTED wrapper actually reaches
+// a request — and boot-gate refusals are asserted by the process exit code. Without these, the
+// wiring (extractSystemPrompt using SYSTEM_PROMPT_WRAPPER, the boot gate, the epoch fold) can be
+// silently reverted with the unit suite still green — the maintainer's #1 rejection pattern.
+import { spawn as _ltSpawn, execFileSync as _ltExecFile } from "node:child_process";
+import { createServer as _ltNetServer } from "node:net";
+import { writeFileSync as _ltWrite, chmodSync as _ltChmod, readFileSync as _ltRead, existsSync as _ltExists, rmSync as _ltRm, mkdtempSync as _ltMkdtemp } from "node:fs";
+import { tmpdir as _ltTmp } from "node:os";
+import { fileURLToPath as _ltF2P } from "node:url";
+
+const LT_SERVER = _ltF2P(new URL("./server.mjs", import.meta.url));
+const LT_POSIX = process.platform !== "win32"; // fake is a /bin/sh script; CI is POSIX
+const LT_NEG_MARK = "You do NOT have access to any local filesystem";
+const LT_POS_MARK = "you may use your available local tools";
+// Fake claude: record the effective system prompt it was spawned with -- either the raw
+// --system-prompt value, or (current OCP: --system-prompt-file) the CONTENT of the file at
+// that path -- bump an optional spawn counter, then emit a minimal valid stream-json response
+// so the request completes (and caches).
+const LT_FAKE = `#!/bin/sh
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--system-prompt" ]; then printf '%s' "$a" > "$SP_CAPTURE"; fi
+  if [ "$prev" = "--system-prompt-file" ]; then cat "$a" > "$SP_CAPTURE"; fi
+  prev="$a"
+done
+if [ -n "$SP_COUNTER" ]; then c=$(cat "$SP_COUNTER" 2>/dev/null || echo 0); echo $((c+1)) > "$SP_COUNTER"; fi
+printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}'
+printf '%s\\n' '{"type":"result"}'
+exit 0
+`;
+
+function ltMkdir() { return _ltMkdtemp(join(_ltTmp(), "ocp-lt-")); }
+function ltFake(dir) { const p = join(dir, "claude"); _ltWrite(p, LT_FAKE); _ltChmod(p, 0o755); return p; }
+function ltBoot(env, dir, nodeArgs = []) {
+  const child = _ltSpawn(process.execPath, [...nodeArgs, LT_SERVER], {
+    env: { ...process.env, NODE_ENV: "test", OCP_DIR_OVERRIDE: dir, OCP_SKIP_AUTH_TEST: "1",
+           CLAUDE_BIND: "127.0.0.1", CLAUDE_AUTH_MODE: "none", CLAUDE_CACHE_TTL: "0", CLAUDE_TIMEOUT: "4000", ...env },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const buf = { out: "", err: "", exit: undefined, signal: undefined, closed: false, closeMs: undefined, spawnErr: null, t0: Date.now() };
+  child.stdout.on("data", d => { buf.out += d; });
+  child.stderr.on("data", d => { buf.err += d; });
+  // 'exit' fires when the process terminates, but its stdio pipes may still hold unread data —
+  // 'close' is the one that guarantees both are drained. A test that terminates the child and
+  // then asserts on buf.err/buf.out must wait for `closed`, not `exit != null`, or it can read
+  // an empty buffer.
+  child.on("exit", (code, signal) => { buf.exit = code; buf.signal = signal; });
+  child.on("close", () => { buf.closed = true; buf.closeMs = Date.now() - buf.t0; });
+  // Without a listener, a spawn 'error' is re-thrown as an uncaught exception and takes down the
+  // whole runner instead of failing one test.
+  child.on("error", e => { buf.spawnErr = e; });
+  return { child, buf };
+}
+// child.kill("SIGKILL") kills server.mjs but NOT the fake `claude` grandchildren it spawned, and
+// those can still be writing sp.txt / spawns.txt into `dir` while rmSync walks it — which surfaced
+// as an intermittent ENOTEMPTY (4/200 in review). Node's own retry loop handles the window.
+function _ltRmRetry(dir) {
+  try { _ltRm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); }
+  catch (e) {
+    // Never throw: this runs in a finally, so a throw here would REPLACE the real assertion
+    // error and make a flake look like a regression. LT_DEBUG surfaces it without that risk.
+    if (process.env.LT_DEBUG) console.warn(`    [ltRmRetry] ${dir}: ${e.code || e.message}`);
+  }
+}
+// Every ltBoot assertion failure should be self-diagnosing. The historical failure text was
+// `expected a local-tools FATAL, got: ` — an empty string, which says nothing about whether the
+// child never wrote, wrote to the other stream, died on a signal, or was never spawned.
+// stdout is sampled HEAD+TAIL, not tail-only. The decisive string for "it booted instead of
+// refusing" is "Local tools: ON", and it lives in the boot banner — a tail-only sample answered
+// the wrong question for exactly the tests this exists to diagnose.
+//
+// The head is sized to the BANNER, not picked round: measured on this tree, the banner runs 1118B
+// with "Local tools: ON" at byte 581, so 900 clears it with ~5 banner lines of margin. That sizing
+// is what makes it robust — the banner is emitted first and is bounded, so however much request
+// noise follows, byte 581 stays in the head. A head of 120 does NOT reach it (verified: the string
+// landed in the elided middle), which is why this is not the obvious small window.
+// stderr stays head-only: a fatal is the first thing it writes.
+function ltHeadTail(s, head = 900, tail = 160) {
+  return s.length <= head + tail ? s : `${s.slice(0, head)}…[${s.length - head - tail}B]…${s.slice(-tail)}`;
+}
+function ltDiag(buf) {
+  // closeMs disambiguates "died before reaching the gate" from "ran, then gated" — an exit=1
+  // with empty stderr is equally consistent with both, and they have unrelated root causes.
+  // node= is here because a Node-version-specific stderr warning (22's SQLite ExperimentalWarning)
+  // once masqueraded as "server did not start" for ~23 of 50 runs on a Linux box.
+  const ms = buf.closeMs !== undefined ? `${buf.closeMs}ms` : `${Date.now() - buf.t0}ms(still open)`;
+  return `exit=${buf.exit} signal=${buf.signal} closed=${buf.closed} closeMs=${ms} node=${process.version}` +
+         (buf.spawnErr ? ` spawnErr=${buf.spawnErr.code || buf.spawnErr.message}` : "") +
+         ` | stderr(${buf.err.length}B)=${JSON.stringify(buf.err.slice(0, 240))}` +
+         ` | stdout(${buf.out.length}B)=${JSON.stringify(ltHeadTail(buf.out))}`;
+}
+async function ltWait(cond, ms = 9000) {
+  const start = Date.now();
+  while (Date.now() - start < ms) { if (cond()) return true; await new Promise(r => setTimeout(r, 40)); }
+  return false;
+}
+async function ltFreePort() {
+  const srv = _ltNetServer();
+  await new Promise(r => srv.listen(0, "127.0.0.1", r));
+  const p = srv.address().port;
+  await new Promise(r => srv.close(r));
+  return p;
+}
+async function ltPost(port, body) {
+  try {
+    await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+  } catch { /* the fake may close the socket; the spawn (and capture) already happened */ }
+}
+
+console.log("\nOCP_LOCAL_TOOLS integration (boot server.mjs):");
+
+test("integration: OCP_LOCAL_TOOLS=1 → the -p spawn receives the POSITIVE wrapper (kills the no-op mutation)", async () => {
+  if (!LT_POSIX) return; // sh fake — skip on Windows CI
+  const dir = ltMkdir(); const cap = join(dir, "sp.txt"); const fake = ltFake(dir);
+  const port = await ltFreePort();
+  const { child, buf } = ltBoot({ OCP_LOCAL_TOOLS: "1", CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), SP_CAPTURE: cap }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0,200)}`);
+    await ltPost(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+    assert.ok(await ltWait(() => _ltExists(cap)), "fake claude was spawned and captured --system-prompt");
+    const sp = _ltRead(cap, "utf8");
+    assert.ok(sp.includes(LT_POS_MARK), `expected POSITIVE wrapper in --system-prompt, got: ${sp.slice(0,90)}`);
+    assert.ok(!sp.includes(LT_NEG_MARK), "positive wrapper must REPLACE the negative one, not append");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+test("integration: flag OFF → the -p spawn receives the EXACT negative wrapper (default path byte-for-byte)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const cap = join(dir, "sp.txt"); const fake = ltFake(dir);
+  const port = await ltFreePort();
+  const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), SP_CAPTURE: cap }, dir); // OCP_LOCAL_TOOLS unset
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on") || buf.exit != null), `server did not start: ${buf.err.slice(0,200)}`);
+    await ltPost(port, { model: "sonnet", messages: [{ role: "user", content: "hi" }] });
+    assert.ok(await ltWait(() => _ltExists(cap)), "fake claude captured --system-prompt");
+    const sp = _ltRead(cap, "utf8");
+    // No system messages + no CLAUDE_SYSTEM_PROMPT → the wrapper is passed verbatim.
+    assert.equal(sp, `You are accessed via the OCP HTTP proxy. You do NOT have access to any local filesystem, working directory, shell, git status, or machine environment. Do not infer or invent such information from any context you observe. Respond only based on the conversation provided.`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+test("integration: boot gate REFUSES each unsafe config (multi / non-loopback / anon key)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const cases = [
+    { label: "multi", env: { CLAUDE_AUTH_MODE: "multi" } },
+    { label: "non-loopback", env: { CLAUDE_BIND: "0.0.0.0" } },
+    { label: "anon", env: { PROXY_ANONYMOUS_KEY: "pub" } },
+  ];
+  try {
+    for (const c of cases) {
+      const port = await ltFreePort();
+      const { child, buf } = ltBoot({ OCP_LOCAL_TOOLS: "1", CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), ...c.env }, dir);
+      try {
+        // Wait for `closed`, not `exit`: the assertion below reads buf.err, and stderr is only
+        // guaranteed drained at 'close'. This is the ordering #203 was filed for.
+        assert.ok(await ltWait(() => buf.closed || buf.spawnErr), `[${c.label}] process never closed — ${ltDiag(buf)}`);
+        assert.notEqual(buf.exit, 0, `[${c.label}] must exit non-zero — ${ltDiag(buf)}`);
+        assert.ok(/FATAL[\s\S]*OCP_LOCAL_TOOLS/.test(buf.err), `[${c.label}] expected a local-tools FATAL — ${ltDiag(buf)}`);
+      } finally { child.kill("SIGKILL"); }
+    }
+  } finally { _ltRmRetry(dir); }
+});
+
+test("integration: safe single-user config BOOTS past the gate and announces local tools", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const port = await ltFreePort();
+  const { child, buf } = ltBoot({ OCP_LOCAL_TOOLS: "1", CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port) }, dir); // loopback + none
+  try {
+    // Same race as #199, one line over: "Local tools: ON" (server.mjs:3640) is written 12
+    // console.log calls after "listening on" (:3627) — 10 of them in this env, since the
+    // SYSTEM_PROMPT and MCP_CONFIG lines are conditional and unset here. Gating on the boot
+    // marker and then asserting the announcement can therefore read a buffer holding only the
+    // first chunk. Wait for the line actually under assertion. Measured by review at 8/200
+    // before this change and 0/200 after — it was the suite's top flake.
+    assert.ok(await ltWait(() => buf.out.includes("Local tools: ON") || buf.closed || buf.spawnErr),
+      `startup must announce local tools when active — ${ltDiag(buf)}`);
+    assert.ok(buf.out.includes("Local tools: ON"),
+      `startup must announce local tools when active — ${ltDiag(buf)}`);
+    // Nails ltHeadTail's head budget to the thing it exists to capture. Without this the
+    // coupling is silent: every added banner line pushes "Local tools: ON" later (Models:
+    // alone is ~18B per model), and the day it crosses 900 the diagnostic degrades back to
+    // the exact blind spot this PR fixed — with no test going red. Measured offset here is
+    // 581 of a 1118B banner, so the margin is ~17 more models.
+    const _ltOffset = buf.out.indexOf("Local tools: ON");
+    assert.ok(_ltOffset < 900,
+      `ltHeadTail's head budget (900B) no longer reaches the local-tools announcement — it is ` +
+      `now at byte ${_ltOffset}. The banner grew. Raise the head in ltHeadTail, or ltDiag will ` +
+      `silently stop showing the one line that distinguishes "booted" from "refused".`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+test("integration: TUI mode → flag is announced INERT (not 'ON'), boot not refused", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  // Non-loopback would normally trip the local-tools gate; under TUI the flag is inert so the
+  // gate must NOT fire on its behalf. Use loopback here to isolate TUI's own guards from ours.
+  const port = await ltFreePort();
+  const { child, buf } = ltBoot({ OCP_LOCAL_TOOLS: "1", CLAUDE_TUI_MODE: "true", CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port) }, dir);
+  try {
+    // Wait for the line actually under assertion, not for a proxy signal. "listening on" and the
+    // inert-flag warning are written independently, so gating on the former and then asserting
+    // the latter is a race — the flake #199 was filed for. Still bounded by the same timeout, and
+    // the boot markers are kept in the predicate so a failed boot ends the wait immediately
+    // rather than burning it.
+    const ready = await ltWait(() => /ignored in TUI mode/.test(buf.out + buf.err)
+                                  || buf.closed || buf.spawnErr);
+    assert.ok(ready, `no inert-flag warning appeared — ${ltDiag(buf)}`);
+    assert.ok(/ignored in TUI mode/.test(buf.out + buf.err),
+      `must warn that OCP_LOCAL_TOOLS is inert under TUI — ${ltDiag(buf)}`);
+    assert.ok(!buf.out.includes("Local tools: ON"),
+      `must NOT claim local tools are ON in TUI mode (the wrapper is unused there) — ${ltDiag(buf)}`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+test("integration: toggling OCP_LOCAL_TOOLS invalidates the standard response cache (epoch fold)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
+  const req = { model: "sonnet", messages: [{ role: "user", content: "epoch-probe" }] };
+  const bootOnce = async (env, port) => {
+    const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter, ...env }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0,160)}`);
+      _ltWrite(counter, "0"); // reset AFTER boot so boot-time spawns (if any) don't count
+      await ltPost(port, req);
+      await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 3000); // give the spawn a beat
+      return Number(_ltRead(counter, "utf8")) || 0;
+    } finally { child.kill("SIGKILL"); }
+  };
+  try {
+    const off = await bootOnce({}, await ltFreePort());                       // caches "OK" under epoch(negative)
+    const on = await bootOnce({ OCP_LOCAL_TOOLS: "1" }, await ltFreePort());  // same DB, epoch(positive) → must MISS → re-spawn
+    assert.equal(off, 1, "first request (cache empty) must spawn claude");
+    assert.equal(on, 1, "after toggling the flag the identical request must NOT be served from the old cache (epoch differs → re-spawn)");
+  } finally { _ltRmRetry(dir); }
+});
+
+// ── active-request counter is paired to the process lifecycle (#180 / #193) ──
+// The counter used to be incremented ~40 lines before the spawn, while its only decrement
+// (cleanup()) is wired to that proc's events — so any SYNCHRONOUS throw in between leaked +1
+// permanently. Driving that fault needs no production hook and no test double: buildCliArgs
+// does `args.push("--allowedTools", ...ALLOWED_TOOLS)`, and a spread of enough elements throws
+// RangeError synchronously, right inside the window.
+//
+// Getting there on Linux needs one more turn of the screw. The spread's cost is per ELEMENT,
+// so the naive form needs ~124k elements ≈ 250KB in one env var — and Linux caps a single env
+// string at MAX_ARG_STRLEN (32 * PAGE_SIZE = 131072 on x86-64), so execve rejects it (E2BIG).
+// Encoding around it fails too: empty items are 1 byte each, but `.filter(Boolean)`
+// (server.mjs:355) strips them, so ALLOWED_TOOLS ends up empty and the spread branch is never
+// entered at all.
+//
+// The lever is the stack: the throw threshold scales with it, and ltBoot spawns the server, so
+// the test owns its argv. Running the child under --stack-size=200 drops the threshold ~5x
+// (~24k elements ≈ 48KB), which fits Linux's limit with room to spare.
+//
+// The threshold is DISCOVERED, in a child under the SAME --stack-size (measuring it in this
+// process would report the parent's stack, which is not the one that matters), then taken with
+// 1.5x margin and hard-asserted under MAX_ARG_STRLEN. A hard-coded count would silently stop
+// triggering on another machine and the test would pass vacuously.
+const LT_STACK = 200;                 // child V8 stack (KB); lowers the spread-throw threshold
+const LT_MAX_ARG_STRLEN = 131072;     // Linux, x86-64: 32 * 4096
+function ltSpreadThrowCount(stackKb) {
+  // Binary-search the smallest element count whose spread throws, inside a child running with
+  // the stack the server will actually use.
+  const src = `const t=n=>{try{const a=[];a.push("--allowedTools",...Array(n).fill("x"));return false}catch{return true}};` +
+              `let lo=500,hi=400000;if(!t(hi)){console.log(0)}else{while(lo<hi){const m=(lo+hi)>>1;t(m)?hi=m:lo=m+1}console.log(lo)}`;
+  try {
+    return Number(String(_ltExecFile(process.execPath, [`--stack-size=${stackKb}`, "-e", src], { encoding: "utf8" })).trim()) || 0;
+  } catch { return 0; }
+}
+async function ltPostStatus(port, body) {
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    return { status: r.status, text: await r.text() };
+  } catch { return { status: 0, text: "" }; }
+}
+
+console.log("\nactive-request counter pairing (#180 / #193):");
+
+test("integration: a synchronous pre-spawn throw must not leak stats.activeRequests", async () => {
+  if (!LT_POSIX) return;
+  const thr = ltSpreadThrowCount(LT_STACK);
+  assert.ok(thr > 0, `no spread-throw threshold found under --stack-size=${LT_STACK}`);
+  const n = Math.ceil(thr * 1.5);                       // margin over the measured threshold
+  const entry = Array(n).fill("x").join(",");
+  const bytes = Buffer.byteLength(entry);
+  // Hard gate: if this ever stops fitting, fail loudly rather than regress to an E2BIG skip.
+  assert.ok(bytes <= LT_MAX_ARG_STRLEN,
+    `env entry ${bytes}B exceeds MAX_ARG_STRLEN ${LT_MAX_ARG_STRLEN}B — lower LT_STACK`);
+  const port = await ltFreePort();
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const { child, buf } = ltBoot({
+    CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), CLAUDE_ALLOWED_TOOLS: entry,
+  }, dir, [`--stack-size=${LT_STACK}`]);
+  let spawnErr = null;
+  child.on("error", e => { spawnErr = e; });
+  try {
+    const up = await ltWait(() => buf.out.includes("listening on") || spawnErr, 20000);
+    assert.ok(up && !spawnErr, `did not start: ${spawnErr ? spawnErr.message : buf.err.slice(0, 300)}`);
+    const req = { model: "haiku", messages: [{ role: "user", content: "leak-probe" }] };
+    const res = [];
+    for (let i = 0; i < 3; i++) res.push(await ltPostStatus(port, req));
+    // Non-vacuous on two axes: the requests must actually fail, AND the failure must be the
+    // stack overflow from the --allowedTools spread — not some unrelated 500 that a small
+    // stack happened to produce. Without the second check a different fault would still leave
+    // the counter at 0 and the test would "pass" for the wrong reason.
+    assert.deepEqual(res.map(r => r.status), [500, 500, 500],
+      `expected the pre-spawn throw to surface as 500s, got ${res.map(r => r.status)}`);
+    assert.ok(res.every(r => /call stack size exceeded/i.test(r.text)),
+      `500s must come from the spread's RangeError; got: ${res[0].text.slice(0, 200)}`);
+    const r = await fetch(`http://127.0.0.1:${port}/status`);
+    const active = (await r.json()).requests.active;
+    assert.equal(active, 0,
+      `3 requests threw before their spawn; the counter must be back to 0, got ${active} (this is the #180 leak)`);
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// ── Cache keys hash the RESOLVED model, not the alias string (#194) ──────────
+// models.json is read once at boot, so repointing an alias only takes effect on restart —
+// while the SQLite response_cache outlives it. Hashing the raw string would keep serving the
+// OLD model's answers under that alias until TTL expiry. Rather than mutate models.json
+// mid-suite, these assert the equivalent observable: an alias and its canonical target must
+// land on the SAME cache slot, which is true only if the key is resolved before hashing.
+// Mutation: change `cacheModel` back to `model` at the three cacheHash call sites in
+// server.mjs and both tests go red (2 spawns instead of 1).
+
+// Fake that emits schema-valid JSON, so the structured path caches a VALIDATED result
+// (the stock LT_FAKE returns "OK", which fails validation → refusal → never cached).
+const LT_FAKE_JSON = `#!/bin/sh
+if [ -n "$SP_COUNTER" ]; then c=$(cat "$SP_COUNTER" 2>/dev/null || echo 0); echo $((c+1)) > "$SP_COUNTER"; fi
+printf '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"{\\"ok\\":true}"}]}}'
+printf '%s\\n' '{"type":"result"}'
+exit 0
+`;
+function ltFakeJson(dir) { const p = join(dir, "claude-json"); _ltWrite(p, LT_FAKE_JSON); _ltChmod(p, 0o755); return p; }
+const LT_SCHEMA = { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false };
+
+console.log("\nCache key resolves the model alias (#194):");
+
+test("integration: an alias and its canonical target share ONE cache slot (normal path)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
+  const port = await ltFreePort();
+  const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
+    _ltWrite(counter, "0");
+    const msgs = [{ role: "user", content: "alias-resolution-probe" }];
+    await ltPost(port, { model: "sonnet", messages: msgs });                 // miss → spawn
+    await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 3000);
+    await ltPost(port, { model: "claude-sonnet-5", messages: msgs });        // same resolved model → HIT
+    await new Promise(r => setTimeout(r, 600));
+    assert.equal(Number(_ltRead(counter, "utf8")) || 0, 1,
+      "the canonical id must hit the slot the alias populated — a 2nd spawn means the key still hashes the raw alias");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+test("integration: an alias and its canonical target share ONE cache slot (STRUCTURED path)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFakeJson(dir); const counter = join(dir, "spawns.txt");
+  const port = await ltFreePort();
+  const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
+    _ltWrite(counter, "0");
+    const rf = { type: "json_schema", json_schema: { name: "probe", schema: LT_SCHEMA } };
+    const msgs = [{ role: "user", content: "structured-alias-probe" }];
+    await ltPost(port, { model: "sonnet", messages: msgs, response_format: rf });
+    await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 4000);
+    await ltPost(port, { model: "claude-sonnet-5", messages: msgs, response_format: rf });
+    await new Promise(r => setTimeout(r, 600));
+    assert.equal(Number(_ltRead(counter, "utf8")) || 0, 1,
+      "structured cache key must resolve the alias too — this is the path the epoch-only fix missed");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+// MODEL_MAP is models[] + aliases + legacyAliases, so resolving covers legacyAliases for free.
+// The three tests above all use `sonnet` (a plain alias); this pins the legacyAlias leg explicitly
+// rather than leaving it covered only by construction.
+test("integration: a legacyAlias shares ONE cache slot with its canonical target", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir); const counter = join(dir, "spawns.txt");
+  const port = await ltFreePort();
+  const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter }, dir);
+  try {
+    assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
+    _ltWrite(counter, "0");
+    const msgs = [{ role: "user", content: "legacy-alias-probe" }];
+    await ltPost(port, { model: "claude-haiku-4-5", messages: msgs });            // legacyAlias
+    await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 3000);
+    await ltPost(port, { model: "claude-haiku-4-5-20251001", messages: msgs });   // canonical
+    await new Promise(r => setTimeout(r, 600));
+    assert.equal(Number(_ltRead(counter, "utf8")) || 0, 1,
+      "legacyAliases live in MODEL_MAP too — resolving must collapse them onto the canonical slot");
+  } finally { child.kill("SIGKILL"); _ltRmRetry(dir); }
+});
+
+test("integration: a config change invalidates the STRUCTURED cache too (closes the #177 gap)", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFakeJson(dir); const counter = join(dir, "spawns.txt");
+  const rf = { type: "json_schema", json_schema: { name: "probe", schema: LT_SCHEMA } };
+  const req = { model: "sonnet", messages: [{ role: "user", content: "structured-epoch-probe" }], response_format: rf };
+  const bootOnce = async (env, port) => {
+    const { child, buf } = ltBoot({ CLAUDE_BIN: fake, CLAUDE_PROXY_PORT: String(port), CLAUDE_CACHE_TTL: "60000", SP_COUNTER: counter, ...env }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `did not start: ${buf.err.slice(0, 200)}`);
+      _ltWrite(counter, "0");
+      await ltPost(port, req);
+      await ltWait(() => (Number(_ltRead(counter, "utf8")) || 0) >= 1, 4000);
+      return Number(_ltRead(counter, "utf8")) || 0;
+    } finally { child.kill("SIGKILL"); }
+  };
+  try {
+    const off = await bootOnce({}, await ltFreePort());                        // caches under epoch(negative wrapper)
+    const on = await bootOnce({ OCP_LOCAL_TOOLS: "1" }, await ltFreePort());   // same DB, epoch differs → must re-spawn
+    assert.equal(off, 1, "first structured request (cache empty) must spawn claude");
+    assert.equal(on, 1, "structured cache must honor CONFIG_EPOCH — before #194 it omitted the epoch entirely and served the stale answer");
+  } finally { _ltRmRetry(dir); }
+});
+
 // ── Upgrade Tests ──
-import { runUpgrade } from "./scripts/upgrade.mjs";
+import { runUpgrade, postFlightOk } from "./scripts/upgrade.mjs";
 
 console.log("\nUpgrade:");
+
+// ── postFlightOk (issue #173) — the acceptance predicate for phase 6 ─────────
+// Mutation-proof: revert the version comparison to auth-only and the "stale process
+// still holds the port" test below goes green-to-red (that case is the 2026-07-17
+// Oracle incident: orphan answered auth.ok=true while serving the OLD version).
+test("postFlightOk: rejects a healthy-looking probe that serves the WRONG version (orphan case)", () => {
+  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.21.1" }, "v3.22.1"), false);
+});
+
+test("postFlightOk: accepts auth.ok + exact target version, tolerating the leading v", () => {
+  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, "v3.22.1"), true);
+  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, "3.22.1"), true);
+});
+
+test("postFlightOk: auth failure rejects regardless of version", () => {
+  assert.equal(postFlightOk({ auth: { ok: false }, version: "3.22.1" }, "v3.22.1"), false);
+  assert.equal(postFlightOk({ version: "3.22.1" }, "v3.22.1"), false);
+  assert.equal(postFlightOk(null, "v3.22.1"), false);
+});
+
+test("postFlightOk: unknown/empty target degrades to the auth-only check (never blocks)", () => {
+  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, ""), true);
+  assert.equal(postFlightOk({ auth: { ok: true }, version: "3.22.1" }, undefined), true);
+});
 
 test("upgrade --dry-run prints plan, no side effects", async () => {
   const result = await runUpgrade({
@@ -880,6 +1463,41 @@ import { join as testJoin } from "node:path";
 
 console.log("\nSnapshot:");
 
+const portableSnapshotName = (isoTimestamp) => `upgrade-snapshot-${isoTimestamp.replace(/:/g, "-")}`;
+const legacyMixedSnapshot = "upgrade-snapshot-2026-05-11T09:05:00Z";
+const portableMixedSnapshot = "upgrade-snapshot-2026-05-11T09-47-00Z";
+
+function runMixedSnapshotScenario() {
+  // NTFS rejects the legacy ':' name, so exercise the real exported functions
+  // in an isolated process whose built-in fs bindings expose both formats.
+  const moduleUrl = new URL("./scripts/lib/snapshot.mjs", import.meta.url).href;
+  const script = `
+    import fs from "node:fs";
+    import { syncBuiltinESMExports } from "node:module";
+    const names = ${JSON.stringify([legacyMixedSnapshot, portableMixedSnapshot])};
+    const deleted = [];
+    fs.existsSync = () => true;
+    fs.readdirSync = () => [...names];
+    fs.statSync = () => ({ mtimeMs: 0 });
+    fs.rmSync = (path) => { deleted.push(path); };
+    syncBuiltinESMExports();
+    const { listSnapshots, gcSnapshots } = await import(${JSON.stringify(moduleUrl)});
+    const listed = listSnapshots("/virtual-home").map(snapshot => snapshot.name);
+    const gc = gcSnapshots("/virtual-home", {
+      keepCount: 1,
+      keepDays: 0,
+      now: new Date("2026-05-12T00:00:00Z")
+    });
+    process.stdout.write(JSON.stringify({
+      listed,
+      kept: gc.kept.map(snapshot => snapshot.name),
+      removed: gc.removed.map(snapshot => snapshot.name),
+      deleted
+    }));
+  `;
+  return JSON.parse(execFileSync(process.execPath, ["--input-type=module", "--eval", script], { encoding: "utf8" }));
+}
+
 test("writeSnapshot creates dir + manifest files", () => {
   const root = mkdtempSync(testJoin(tmpdir(), "ocp-snap-test-"));
   const dotOcp = testJoin(root, ".ocp");
@@ -904,13 +1522,26 @@ test("listSnapshots returns sorted by ISO timestamp", () => {
   const dotOcp = testJoin(root, ".ocp");
   tMkdirSync(dotOcp, { recursive: true });
   for (const ts of ["2026-05-01T10:00:00Z", "2026-05-02T10:00:00Z", "2026-05-03T10:00:00Z"]) {
-    tMkdirSync(testJoin(dotOcp, `upgrade-snapshot-${ts}`));
+    tMkdirSync(testJoin(dotOcp, portableSnapshotName(ts)));
   }
   const list = listSnapshots(root);
   assert.equal(list.length, 3);
   assert.ok(list[0].path.includes("2026-05-01"));
   assert.ok(list[2].path.includes("2026-05-03"));
   rmSync(root, { recursive: true, force: true });
+});
+
+test("listSnapshots sorts mixed legacy and Windows-safe names chronologically", () => {
+  const result = runMixedSnapshotScenario();
+  assert.deepEqual(result.listed, [legacyMixedSnapshot, portableMixedSnapshot]);
+});
+
+test("gcSnapshots keeps the newer Windows-safe snapshot across the format boundary", () => {
+  const result = runMixedSnapshotScenario();
+  assert.deepEqual(result.kept, [portableMixedSnapshot]);
+  assert.deepEqual(result.removed, [legacyMixedSnapshot]);
+  assert.equal(result.deleted.length, 1);
+  assert.ok(result.deleted[0].endsWith(legacyMixedSnapshot));
 });
 
 test("upgrade error after snapshot carries snapshotPath + hint", async () => {
@@ -1002,7 +1633,7 @@ test("gcSnapshots keeps last N regardless of age", () => {
   const dotOcp = testJoin(root, ".ocp");
   tMkdirSync(dotOcp, { recursive: true });
   for (const ts of ["2026-04-01T10:00:00Z", "2026-04-15T10:00:00Z", "2026-04-30T10:00:00Z", "2026-05-01T10:00:00Z", "2026-05-10T10:00:00Z"]) {
-    tMkdirSync(testJoin(dotOcp, `upgrade-snapshot-${ts}`));
+    tMkdirSync(testJoin(dotOcp, portableSnapshotName(ts)));
   }
   const result = gcSnapshots(root, { keepCount: 3, keepDays: 0, now: new Date("2026-05-11T00:00:00Z") });
   assert.equal(result.kept.length, 3);
@@ -1085,7 +1716,7 @@ test("gcSnapshots keeps snapshots newer than keepDays regardless of count", () =
   const dotOcp = testJoin(root, ".ocp");
   tMkdirSync(dotOcp, { recursive: true });
   for (const ts of ["2026-04-01T10:00:00Z", "2026-04-15T10:00:00Z", "2026-04-30T10:00:00Z", "2026-05-01T10:00:00Z", "2026-05-10T10:00:00Z"]) {
-    tMkdirSync(testJoin(dotOcp, `upgrade-snapshot-${ts}`));
+    tMkdirSync(testJoin(dotOcp, portableSnapshotName(ts)));
   }
   // keepCount=1 but keepDays=15 means anything from after 2026-04-26 is kept too
   const result = gcSnapshots(root, { keepCount: 1, keepDays: 15, now: new Date("2026-05-11T00:00:00Z") });
@@ -1099,7 +1730,7 @@ test("gcSnapshots never deletes the most recent snapshot", () => {
   const root = mkdtempSync(testJoin(tmpdir(), "ocp-gc-recent-"));
   const dotOcp = testJoin(root, ".ocp");
   tMkdirSync(dotOcp, { recursive: true });
-  tMkdirSync(testJoin(dotOcp, "upgrade-snapshot-2026-01-01T10:00:00Z"));
+  tMkdirSync(testJoin(dotOcp, portableSnapshotName("2026-01-01T10:00:00Z")));
   // Even with keepCount=0 and keepDays=0, the most recent must survive
   const result = gcSnapshots(root, { keepCount: 0, keepDays: 0, now: new Date("2026-05-11T00:00:00Z") });
   assert.equal(result.kept.length, 1);
@@ -1112,13 +1743,13 @@ test("gcSnapshots --dry-run reports plan without deleting", () => {
   const dotOcp = testJoin(root, ".ocp");
   tMkdirSync(dotOcp, { recursive: true });
   for (const ts of ["2026-04-01T10:00:00Z", "2026-04-15T10:00:00Z", "2026-05-10T10:00:00Z"]) {
-    tMkdirSync(testJoin(dotOcp, `upgrade-snapshot-${ts}`));
+    tMkdirSync(testJoin(dotOcp, portableSnapshotName(ts)));
   }
   const result = gcSnapshots(root, { keepCount: 1, keepDays: 0, dryRun: true, now: new Date("2026-05-11T00:00:00Z") });
   assert.equal(result.dryRun, true);
   assert.equal(result.removed.length, 2);
   // Files still exist
-  assert.ok(testExistsSync(testJoin(dotOcp, "upgrade-snapshot-2026-04-01T10:00:00Z")));
+  assert.ok(testExistsSync(testJoin(dotOcp, portableSnapshotName("2026-04-01T10:00:00Z"))));
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -1198,7 +1829,7 @@ function parseStreamJsonLines(buffered) {
   return { events, remainder: remainder ?? "" };
 }
 
-function parseStreamJsonEvent(event, isFirstDelta) {
+function parseStreamJsonEvent(event, sawTextDelta) {
   const t = event?.type;
 
   // system/* — first-event init + other system meta (api_retry etc.)
@@ -1210,19 +1841,19 @@ function parseStreamJsonEvent(event, isFirstDelta) {
   if (t === "stream_event") {
     const inner = event.event ?? event;
     if (inner?.type === "content_block_delta" && inner.delta?.type === "text_delta") {
-      return { text: inner.delta.text ?? "" };
+      return { text: inner.delta.text ?? "", fromDelta: true };
     }
     // Other stream_event sub-types (content_block_start, message_delta, etc.) — consumed
     return null;
   }
 
-  // assistant — aggregate message (fallback when no prior content_block_delta seen)
-  // Empirically (claude CLI without --include-partial-messages, verified v2.1.104 through v2.1.158): fast/short
-  // responses may emit ONLY the aggregate assistant event, no content_block_delta events.
-  // If isFirstDelta is true, extract text here; otherwise it's a duplicate, ignore.
+  // assistant — aggregate message. Without --include-partial-messages each assistant message
+  // arrives as its own aggregate event; an agentic turn emits several (preamble + tool rounds +
+  // final answer), so accumulate EVERY one. Only guard the delta+aggregate double-count case:
+  // if streaming deltas were already seen (sawTextDelta), the aggregate duplicates them.
   // Reference: OLP commit 65f945c (assistant-aggregate fallback, fold-in).
   if (t === "assistant") {
-    if (isFirstDelta) {
+    if (!sawTextDelta) {
       const blocks = event.message?.content;
       if (Array.isArray(blocks)) {
         const text = blocks
@@ -1271,25 +1902,25 @@ test("parseStreamJsonEvent: stream_event content_block_delta yields text", () =>
     type: "stream_event",
     event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hello" } }
   };
-  const result = parseStreamJsonEvent(event, true);
-  assert.deepEqual(result, { text: "Hello" });
+  const result = parseStreamJsonEvent(event, false);
+  assert.deepEqual(result, { text: "Hello", fromDelta: true });
 });
 
-test("parseStreamJsonEvent: assistant-aggregate used when isFirstDelta=true (no prior delta)", () => {
-  const event = {
-    type: "assistant",
-    message: { content: [{ type: "text", text: "Short answer." }] }
-  };
-  const result = parseStreamJsonEvent(event, true);
-  assert.deepEqual(result, { text: "Short answer." });
-});
-
-test("parseStreamJsonEvent: assistant-aggregate skipped when isFirstDelta=false (no double-count)", () => {
+test("parseStreamJsonEvent: assistant-aggregate used when no delta seen (sawTextDelta=false)", () => {
   const event = {
     type: "assistant",
     message: { content: [{ type: "text", text: "Short answer." }] }
   };
   const result = parseStreamJsonEvent(event, false);
+  assert.deepEqual(result, { text: "Short answer." });
+});
+
+test("parseStreamJsonEvent: assistant-aggregate skipped when a delta was seen (sawTextDelta=true, no double-count)", () => {
+  const event = {
+    type: "assistant",
+    message: { content: [{ type: "text", text: "Short answer." }] }
+  };
+  const result = parseStreamJsonEvent(event, true);
   assert.equal(result, null);
 });
 
@@ -1303,12 +1934,37 @@ test("parseStreamJsonEvent: stream_event + assistant → assembled without doubl
     type: "assistant",
     message: { content: [{ type: "text", text: "Streaming text." }] }
   };
-  // First event: isFirstDelta=true → yields text
-  const r1 = parseStreamJsonEvent(delta, true);
-  assert.deepEqual(r1, { text: "Streaming text." });
-  // Second event (aggregate): isFirstDelta is now false (content already emitted) → null
-  const r2 = parseStreamJsonEvent(agg, false);
+  // First event: no delta seen yet → yields text and marks fromDelta
+  const r1 = parseStreamJsonEvent(delta, false);
+  assert.deepEqual(r1, { text: "Streaming text.", fromDelta: true });
+  // Second event (aggregate): a delta was seen (sawTextDelta=true) → duplicate, null
+  const r2 = parseStreamJsonEvent(agg, true);
   assert.equal(r2, null);
+});
+
+// REGRESSION (agentic turns): without --include-partial-messages a tool-using turn emits SEVERAL
+// aggregate `assistant` events (preamble, then the final answer after tool use) and NO deltas.
+// Every one must be captured — the old first-only guard dropped the final answer.
+test("parseStreamJsonEvent: multi-message agentic turn captures preamble AND final answer", () => {
+  const preamble = {
+    type: "assistant",
+    message: { content: [
+      { type: "text", text: "I'll find the homepage repo and remove the calendar." },
+      { type: "tool_use", id: "t1", name: "Bash" },
+    ] }
+  };
+  const toolResult = { type: "user", message: { content: [{ type: "tool_result", content: "ok" }] } };
+  const finalMsg = {
+    type: "assistant",
+    message: { content: [{ type: "text", text: "Done — removed the calendar widget and pushed." }] }
+  };
+  // No deltas are ever emitted in aggregate mode, so sawTextDelta stays false throughout.
+  const r1 = parseStreamJsonEvent(preamble, false);
+  assert.deepEqual(r1, { text: "I'll find the homepage repo and remove the calendar." });
+  const r2 = parseStreamJsonEvent(toolResult, false); // user/tool_result echo — consumed
+  assert.equal(r2, null);
+  const r3 = parseStreamJsonEvent(finalMsg, false);   // <- old code returned null here (bug)
+  assert.deepEqual(r3, { text: "Done — removed the calendar widget and pushed." });
 });
 
 // (b) aggregate-only short response → assembles correctly
@@ -1323,7 +1979,7 @@ test("parseStreamJsonEvent: aggregate-only multi-block response assembles all te
       ]
     }
   };
-  const result = parseStreamJsonEvent(event, true);
+  const result = parseStreamJsonEvent(event, false);
   assert.deepEqual(result, { text: "Part one. Part two." });
 });
 
@@ -1341,8 +1997,8 @@ test("parseStreamJsonLines: partial line carried as remainder", () => {
   assert.equal(ev2[0].type, "stream_event");
   assert.equal(rem2, "");
   // Verify the reassembled event parses through parseStreamJsonEvent correctly
-  const parsed = parseStreamJsonEvent(ev2[0], true);
-  assert.deepEqual(parsed, { text: "Hi" });
+  const parsed = parseStreamJsonEvent(ev2[0], false);
+  assert.deepEqual(parsed, { text: "Hi", fromDelta: true });
 });
 
 test("parseStreamJsonLines: empty input returns no events and empty remainder", () => {
@@ -1829,8 +2485,30 @@ console.log("\nTUI command construction (proxy-purity / #4):");
 test("buildTuiCmd suppresses host CLAUDE.md + auto-memory (proxy purity, #4)", () => {
   const cmd = buildTuiCmd("/usr/bin/claude", "claude-haiku", "sid-1", "/home/u", "cli");
   // OCP is a proxy: the host's CLAUDE.md / auto-memory must never leak into the proxied turn.
+  // Primary mechanism is --safe-mode (env vars alone stopped suppressing on newer claude);
+  // the env vars remain as belt-and-braces.
+  assert.ok(/(^| )--safe-mode( |$)/.test(cmd), "default pane must pass --safe-mode (disables host CLAUDE.md/skills/plugins/hooks)");
   assert.ok(/(^| )CLAUDE_CODE_DISABLE_CLAUDE_MDS=1( |$)/.test(cmd), "must disable CLAUDE.md injection");
   assert.ok(/(^| )CLAUDE_CODE_DISABLE_AUTO_MEMORY=1( |$)/.test(cmd), "must disable auto-memory injection");
+});
+
+test("buildTuiCmd omits --safe-mode when a customization it would strip is in use", () => {
+  const save = process.env.OCP_TUI_FULL_TOOLS;
+  try {
+    delete process.env.OCP_TUI_FULL_TOOLS;
+    // streaming registers a MessageDisplay HOOK via --settings; --safe-mode would kill the hook
+    // (zero deltas), so it must be omitted on the streaming pane.
+    const streaming = buildTuiCmd("/usr/bin/claude", "m", "sid-s", "/home/u", "cli", { file: "/d/sid-s.jsonl", settings: "/d/s.json" });
+    assert.ok(!/--safe-mode/.test(streaming), "streaming pane must NOT pass --safe-mode (would disable the MessageDisplay hook)");
+    assert.ok(streaming.includes("--settings '/d/s.json'"), "streaming pane keeps its --settings hook");
+
+    // OCP_TUI_FULL_TOOLS grants an MCP/skills surface --safe-mode disables wholesale.
+    process.env.OCP_TUI_FULL_TOOLS = "1";
+    const full = buildTuiCmd("/usr/bin/claude", "m", "sid-f", "/home/u", "cli");
+    assert.ok(!/--safe-mode/.test(full), "full-tools pane must NOT pass --safe-mode (would disable MCP/skills)");
+  } finally {
+    if (save === undefined) delete process.env.OCP_TUI_FULL_TOOLS; else process.env.OCP_TUI_FULL_TOOLS = save;
+  }
 });
 
 test("buildTuiCmd keeps version pin + entrypoint label + MCP wall", () => {
@@ -2656,21 +3334,21 @@ import { tmpdir as hTmp } from "node:os";
 console.log("\nTUI home preparation:");
 
 test("prepareTuiHome scratch mode: symlinks creds, seeds onboarded config, trusts cwd, strips history", () => {
-  const realHome = hMkdtemp(`${hTmp()}/real-`);
-  hMkdir(`${realHome}/.claude`, { recursive: true });
-  hWrite(`${realHome}/.claude/.credentials.json`, '{"token":"x"}');
-  hWrite(`${realHome}/.claude.json`, JSON.stringify({ theme: "dark", projects: { "/old/secret/project": { hasTrustDialogAccepted: true } } }));
-  const tuiHome = hMkdtemp(`${hTmp()}/tui-`);
-  const cwd = `${tuiHome}/work`;
+  const realHome = hMkdtemp(testJoin(hTmp(), "real-"));
+  hMkdir(testJoin(realHome, ".claude"), { recursive: true });
+  hWrite(testJoin(realHome, ".claude", ".credentials.json"), '{"token":"x"}');
+  hWrite(testJoin(realHome, ".claude.json"), JSON.stringify({ theme: "dark", projects: { "/old/secret/project": { hasTrustDialogAccepted: true } } }));
+  const tuiHome = hMkdtemp(testJoin(hTmp(), "tui-"));
+  const cwd = testJoin(tuiHome, "work");
   prepareTuiHome(realHome, tuiHome, cwd);
   // credentials symlinked (token never copied)
-  assert.equal(hReadlink(`${tuiHome}/.claude/.credentials.json`), `${realHome}/.claude/.credentials.json`);
-  const seed = JSON.parse(hRead(`${tuiHome}/.claude.json`, "utf8"));
+  assert.equal(hReadlink(testJoin(tuiHome, ".claude", ".credentials.json")), testJoin(realHome, ".claude", ".credentials.json"));
+  const seed = JSON.parse(hRead(testJoin(tuiHome, ".claude.json"), "utf8"));
   assert.equal(seed.hasCompletedOnboarding, true);
   assert.equal(seed.theme, "dark");                                   // onboarded config carried over
   assert.equal(seed.projects[cwd].hasTrustDialogAccepted, true);      // scratch cwd trusted
   assert.equal(seed.projects["/old/secret/project"], undefined);      // user project history stripped
-  assert.ok(hExists(`${tuiHome}/.claude/projects`));                  // own projects dir
+  assert.ok(hExists(testJoin(tuiHome, ".claude", "projects")));    // own projects dir
 });
 
 test("prepareTuiHome real mode (tuiHome===realHome): no symlink, just trusts cwd in real config", () => {
@@ -3167,7 +3845,7 @@ if (process.env.OCP_TUI_LIVE === "1") {
 // Replicates tuiInputReady, tuiPromptLanded verbatim from lib/tui/session.mjs.
 // Keep in sync with the definitions there.
 function _tuiInputReady(pane) {
-  return /\? for shortcuts/.test(pane);
+  return /\? for shortcuts|shift\+tab to cycle/.test(pane);
 }
 function _tuiPromptLanded(pane, prompt) {
   const flatPane = pane.replace(/\s+/g, " ");
@@ -3185,7 +3863,12 @@ const TUI_READY_PANE = `❯ Try "how does <filepath> work?"
 const TUI_LANDED_PANE = `❯ Reply with exactly: PONG_TEST
   ? for shortcuts · ← for agents`;
 
-// Welcome splash shown before input bar is rendered — no `? for shortcuts`.
+// Newer claude 2.1.x renders the input bar with a `shift+tab to cycle` footer instead of
+// `? for shortcuts` — the matcher must accept it too, or the pane reads as never-ready.
+const TUI_READY_PANE_SHIFT_TAB = `❯ Try "how does <filepath> work?"
+  ⏵⏵ bypass permissions on (shift+tab to cycle)`;
+
+// Welcome splash shown before input bar is rendered — neither ready-state footer.
 const TUI_BOOT_PANE = `╭─ Claude Code v2.1.114 ─ Welcome back Tao! ─╮\n│ Tips for getting started │`;
 
 console.log("\nTUI readiness + paste-verify predicates (issue #130):");
@@ -3195,6 +3878,9 @@ test("tuiInputReady(READY_PANE) === true  (input bar rendered)", () => {
 });
 test("tuiInputReady(LANDED_PANE) === true  (input bar still present after paste)", () => {
   assert.equal(_tuiInputReady(TUI_LANDED_PANE), true);
+});
+test("tuiInputReady(READY_PANE_SHIFT_TAB) === true  (newer claude `shift+tab to cycle` footer)", () => {
+  assert.equal(_tuiInputReady(TUI_READY_PANE_SHIFT_TAB), true);
 });
 test("tuiInputReady(BOOT_PANE) === false  (welcome splash, no input bar yet)", () => {
   assert.equal(_tuiInputReady(TUI_BOOT_PANE), false);
@@ -3299,6 +3985,337 @@ test("contentToText: null returns empty string", () => {
   assert.equal(contentToText(null), "");
 });
 
+// ── multimodal image transform (issue #110) ──────────────────────────────────
+// OpenAI image_url parts → Anthropic image blocks for `claude -p --input-format
+// stream-json`. lib/multimodal.mjs is a PURE module (no server.listen()), so it is
+// imported directly here. Class B.1: shape per OpenAI vision spec, authorized by
+// ADR 0006. Mechanism verified live: a base64 PNG fed as an Anthropic image block
+// via --input-format stream-json is correctly described by the model.
+import {
+  hasImageContent as mmHasImageContent,
+  buildImageBlocks as mmBuildImageBlocks,
+  buildStreamJsonInput as mmBuildStreamJsonInput,
+  MultimodalError as MmError,
+  SUPPORTED_IMAGE_TYPES as MM_SUPPORTED,
+} from "./lib/multimodal.mjs";
+import { parsePositiveInt } from "./lib/env.mjs";
+
+console.log("\nmultimodal image transform (issue #110):");
+
+// A short, valid base64 string (charset-valid; not decoded by the transform).
+const MM_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGP4DwABAQEAG7buVgAAAABJRU5ErkJggg==";
+const dataUri = (mt = "image/png") => `data:${mt};base64,${MM_B64}`;
+const imgPart = (mt) => ({ type: "image_url", image_url: { url: dataUri(mt) } });
+const txtPart = (t) => ({ type: "text", text: t });
+
+test("hasImageContent: plain string message → false (text path preserved)", () => {
+  assert.equal(mmHasImageContent([{ role: "user", content: "hello" }]), false);
+});
+
+test("hasImageContent: array of text-only parts → false", () => {
+  assert.equal(mmHasImageContent([{ role: "user", content: [txtPart("a"), txtPart("b")] }]), false);
+});
+
+test("hasImageContent: message with an image_url part → true", () => {
+  assert.equal(mmHasImageContent([{ role: "user", content: [txtPart("q"), imgPart()] }]), true);
+});
+
+test("hasImageContent: image anywhere in history (not just last) → true", () => {
+  const msgs = [
+    { role: "user", content: [txtPart("look"), imgPart()] },
+    { role: "assistant", content: "ok" },
+    { role: "user", content: "and now?" },
+  ];
+  assert.equal(mmHasImageContent(msgs), true);
+});
+
+// ── PR #154 review round 2, gap (b): image ONLY in a system message must not silently drop ──
+// The handler detects multimodal on the FULL list but extraction/spawn filter system messages out.
+// The guard fires exactly when the full list has an image but the non-system list does not — proven
+// here against the same predicate the guard uses, so a system-only image is rejected (400) rather
+// than falling to the text path and returning a 200 hallucinated answer.
+test("hasImageContent: image ONLY in a system message → true on full list, false after system filter (guard fires)", () => {
+  const msgs = [
+    { role: "system", content: [txtPart("context"), imgPart()] },
+    { role: "user", content: "describe it" },
+  ];
+  assert.equal(mmHasImageContent(msgs), true, "detected as multimodal on the full list");
+  assert.equal(mmHasImageContent(msgs.filter(m => m.role !== "system")), false, "no image survives the system filter → guard must 400");
+});
+test("hasImageContent: image in a USER message survives the system filter (legitimate request not rejected)", () => {
+  const msgs = [
+    { role: "system", content: "you are helpful" },
+    { role: "user", content: [txtPart("describe it"), imgPart()] },
+  ];
+  assert.equal(mmHasImageContent(msgs.filter(m => m.role !== "system")), true, "user image survives → normal multimodal path");
+});
+
+test("buildImageBlocks: data-URI parsed into an Anthropic base64 image block", () => {
+  const { blocks, stats } = mmBuildImageBlocks([{ role: "user", content: [txtPart("what is this?"), imgPart("image/png")] }]);
+  assert.equal(blocks.length, 2);
+  assert.equal(blocks[0].type, "text");
+  assert.equal(blocks[0].text, "what is this?");
+  assert.deepEqual(blocks[1], { type: "image", source: { type: "base64", media_type: "image/png", data: MM_B64 } });
+  assert.equal(stats.imageCount, 1);
+  assert.ok(stats.totalImageBytes > 0);
+});
+
+test("buildImageBlocks: media_type carried through (jpeg/gif/webp)", () => {
+  for (const mt of ["image/jpeg", "image/gif", "image/webp"]) {
+    const { blocks } = mmBuildImageBlocks([{ role: "user", content: [imgPart(mt)] }]);
+    assert.equal(blocks.find(b => b.type === "image").source.media_type, mt);
+  }
+});
+
+test("buildImageBlocks: multiple images in one message both emitted", () => {
+  const { blocks, stats } = mmBuildImageBlocks([{ role: "user", content: [txtPart("compare"), imgPart(), imgPart()] }]);
+  const imgs = blocks.filter(b => b.type === "image");
+  assert.equal(imgs.length, 2);
+  assert.equal(stats.imageCount, 2);
+});
+
+test("buildImageBlocks: text/image/text ordering preserved", () => {
+  const { blocks } = mmBuildImageBlocks([{ role: "user", content: [txtPart("A"), imgPart(), txtPart("B")] }]);
+  assert.deepEqual(blocks.map(b => (b.type === "text" ? b.text : "IMG")), ["A", "IMG", "B"]);
+});
+
+test("buildImageBlocks: image-first message keeps ordering (image before text)", () => {
+  const { blocks } = mmBuildImageBlocks([{ role: "user", content: [imgPart(), txtPart("caption")] }]);
+  assert.deepEqual(blocks.map(b => (b.type === "text" ? b.text : "IMG")), ["IMG", "caption"]);
+});
+
+test("buildImageBlocks: multi-turn history — role prefixes + separators preserved", () => {
+  const msgs = [
+    { role: "user", content: "first q" },
+    { role: "assistant", content: "prior answer" },
+    { role: "user", content: [txtPart("now this"), imgPart()] },
+  ];
+  const { blocks } = mmBuildImageBlocks(msgs);
+  assert.equal(blocks[0].text, "first q");
+  assert.equal(blocks[1].text, "\n\n[Assistant] prior answer");
+  assert.equal(blocks[2].text, "\n\nnow this");
+  assert.equal(blocks[3].type, "image");
+});
+
+test("buildImageBlocks: image in an EARLIER turn is carried (history image)", () => {
+  const msgs = [
+    { role: "user", content: [txtPart("here"), imgPart()] },
+    { role: "assistant", content: "got it" },
+    { role: "user", content: "thanks" },
+  ];
+  const { blocks, stats } = mmBuildImageBlocks(msgs);
+  assert.equal(stats.imageCount, 1);
+  assert.equal(blocks.filter(b => b.type === "image").length, 1);
+});
+
+test("buildImageBlocks: image_url as bare string is accepted (client leniency)", () => {
+  const { blocks } = mmBuildImageBlocks([{ role: "user", content: [{ type: "image_url", image_url: dataUri() }] }]);
+  assert.equal(blocks.find(b => b.type === "image").source.data, MM_B64);
+});
+
+test("buildStreamJsonInput: emits one newline-terminated user envelope", () => {
+  const { payload } = mmBuildStreamJsonInput([{ role: "user", content: [txtPart("hi"), imgPart()] }]);
+  assert.ok(payload.endsWith("\n"));
+  const env = JSON.parse(payload.trim());
+  assert.equal(env.type, "user");
+  assert.equal(env.message.role, "user");
+  assert.equal(env.message.content[1].type, "image");
+});
+
+// ── malformed / policy / oversized handling (clean 4xx, never a silent drop) ──
+test("buildImageBlocks: unsupported media type → 400 unsupported_image_type", () => {
+  assert.throws(
+    () => mmBuildImageBlocks([{ role: "user", content: [imgPart("image/tiff")] }]),
+    (e) => e instanceof MmError && e.code === "unsupported_image_type" && e.status === 400
+  );
+});
+
+test("buildImageBlocks: non-base64 data URI → 400 invalid_data_uri", () => {
+  assert.throws(
+    () => mmBuildImageBlocks([{ role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png,notbase64" } }] }]),
+    (e) => e instanceof MmError && e.code === "invalid_data_uri" && e.status === 400
+  );
+});
+
+test("buildImageBlocks: malformed data URI (no comma) → 400 invalid_data_uri", () => {
+  assert.throws(
+    () => mmBuildImageBlocks([{ role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64" } }] }]),
+    (e) => e instanceof MmError && e.code === "invalid_data_uri"
+  );
+});
+
+test("buildImageBlocks: image_url part missing a URL → 400 invalid_image_url", () => {
+  assert.throws(
+    () => mmBuildImageBlocks([{ role: "user", content: [{ type: "image_url", image_url: {} }] }]),
+    (e) => e instanceof MmError && e.code === "invalid_image_url"
+  );
+});
+
+test("buildImageBlocks: oversized single image → 413 image_too_large", () => {
+  assert.throws(
+    () => mmBuildImageBlocks([{ role: "user", content: [imgPart()] }], { maxImageBytes: 4 }),
+    (e) => e instanceof MmError && e.code === "image_too_large" && e.status === 413
+  );
+});
+
+test("buildImageBlocks: too many images → 413 too_many_images", () => {
+  const many = Array.from({ length: 3 }, () => imgPart());
+  assert.throws(
+    () => mmBuildImageBlocks([{ role: "user", content: many }], { maxImages: 2 }),
+    (e) => e instanceof MmError && e.code === "too_many_images" && e.status === 413
+  );
+});
+
+test("buildImageBlocks: aggregate image bytes over cap → 413 images_too_large", () => {
+  assert.throws(
+    () => mmBuildImageBlocks([{ role: "user", content: [imgPart(), imgPart()] }], { maxTotalImageBytes: 100, maxImageBytes: 1000 }),
+    (e) => e instanceof MmError && e.code === "images_too_large" && e.status === 413
+  );
+});
+
+test("buildImageBlocks: remote http(s) URL disabled by default → 400 remote_url_disabled", () => {
+  assert.throws(
+    () => mmBuildImageBlocks([{ role: "user", content: [{ type: "image_url", image_url: { url: "https://example.com/a.png" } }] }]),
+    (e) => e instanceof MmError && e.code === "remote_url_disabled" && e.status === 400
+  );
+});
+
+test("buildImageBlocks: remote URL passthrough when allowRemoteUrl=true (url source, OCP does not fetch)", () => {
+  const { blocks } = mmBuildImageBlocks(
+    [{ role: "user", content: [{ type: "image_url", image_url: { url: "https://example.com/a.png" } }] }],
+    { allowRemoteUrl: true }
+  );
+  assert.deepEqual(blocks.find(b => b.type === "image").source, { type: "url", url: "https://example.com/a.png" });
+});
+
+test("buildImageBlocks: unsupported URL scheme → 400 unsupported_url_scheme", () => {
+  assert.throws(
+    () => mmBuildImageBlocks([{ role: "user", content: [{ type: "image_url", image_url: { url: "ftp://x/y.png" } }] }], { allowRemoteUrl: true }),
+    (e) => e instanceof MmError && e.code === "unsupported_url_scheme"
+  );
+});
+
+test("buildImageBlocks: non-image parts (audio/file) fall back to placeholder text", () => {
+  const { blocks } = mmBuildImageBlocks([{ role: "user", content: [txtPart("hear this"), { type: "input_audio", input_audio: {} }] }]);
+  assert.deepEqual(blocks.map(b => b.text), ["hear this", "[non-text content omitted]"]);
+});
+
+test("SUPPORTED_IMAGE_TYPES: exactly the four Anthropic vision types", () => {
+  assert.deepEqual([...MM_SUPPORTED].sort(), ["image/gif", "image/jpeg", "image/png", "image/webp"]);
+});
+
+test("buildImageBlocks: pure-text conversation still yields text blocks (untouched-path parity)", () => {
+  // hasImageContent would be false for this input in server.mjs (text path taken),
+  // but the transform must still be well-defined for a text-only turn.
+  const { blocks, stats } = mmBuildImageBlocks([{ role: "user", content: "just text" }]);
+  assert.deepEqual(blocks, [{ type: "text", text: "just text" }]);
+  assert.equal(stats.imageCount, 0);
+  assert.equal(stats.truncated, false);
+});
+
+// ── F2 (PR #154 review): text char budget is enforced on the multimodal path ──
+// Regression guard: without maxTextChars, attaching one tiny image let unbounded
+// text bypass MAX_PROMPT_CHARS entirely (the text path truncates; the image path
+// did not). server.mjs passes maxTextChars: MAX_PROMPT_CHARS into this transform.
+console.log("\nmultimodal text-budget enforcement (PR #154 F2):");
+
+test("buildImageBlocks: text under budget → not truncated, blocks unchanged", () => {
+  const { blocks, stats } = mmBuildImageBlocks(
+    [{ role: "user", content: [txtPart("short"), imgPart()] }],
+    { maxTextChars: 1000 }
+  );
+  assert.equal(stats.truncated, false);
+  assert.equal(stats.textChars, "short".length);
+  assert.equal(blocks.filter(b => b.type === "image").length, 1);
+});
+
+test("buildImageBlocks: text over budget → truncated, keeps most-recent tail + note", () => {
+  const big = "A".repeat(300) + "TAIL_MARKER";
+  const { blocks, stats } = mmBuildImageBlocks(
+    [{ role: "user", content: [txtPart(big)] }],
+    { maxTextChars: 50 }
+  );
+  assert.equal(stats.truncated, true);
+  assert.equal(stats.originalTextChars, big.length);
+  // The most recent characters (the tail) survive; the oldest 'A's are dropped.
+  const joined = blocks.filter(b => b.type === "text").map(b => b.text).join("");
+  assert.ok(joined.includes("TAIL_MARKER"), "tail text must be kept");
+  assert.ok(joined.includes("truncated to fit"), "a truncation note must be present");
+  assert.ok(stats.originalTextChars > stats.textChars, "post-truncation text is smaller");
+});
+
+test("buildImageBlocks: F2 exact scenario — 500k chars + one image → text bounded, image preserved", () => {
+  const { blocks, stats } = mmBuildImageBlocks(
+    [{ role: "user", content: [txtPart("Z".repeat(500000)), imgPart()] }],
+    { maxTextChars: 150000 }
+  );
+  assert.equal(stats.truncated, true);
+  assert.ok(stats.textChars <= 150000 + 200, "text char count is bounded by the budget (+note)");
+  // The image bypasses the text budget and is NOT dropped by truncation.
+  assert.equal(blocks.filter(b => b.type === "image").length, 1);
+});
+
+test("buildImageBlocks: default (no maxTextChars) never truncates — pure module standalone", () => {
+  const { stats } = mmBuildImageBlocks([{ role: "user", content: [txtPart("x".repeat(10000))] }]);
+  assert.equal(stats.truncated, false);
+  assert.equal(stats.textChars, 10000);
+});
+
+// ── F3 (PR #154 review): fail-closed positive-int env parsing ────────────────
+// A misconfigured numeric cap must NEVER silently disable a guard (`x > NaN` is
+// always false) or brick the proxy with a nonsense value. parsePositiveInt keeps
+// the default and reports ok:false so the caller can warn.
+console.log("\nfail-closed env-cap parsing (PR #154 F3):");
+
+test("parsePositiveInt: missing/empty → default, ok", () => {
+  assert.deepEqual(parsePositiveInt(undefined, 42), { value: 42, ok: true });
+  assert.deepEqual(parsePositiveInt("", 42), { value: 42, ok: true });
+});
+
+test("parsePositiveInt: valid positive integer → parsed value", () => {
+  assert.equal(parsePositiveInt("5000000", 42).value, 5000000);
+  assert.equal(parsePositiveInt("5000000", 42).ok, true);
+});
+
+test("parsePositiveInt: 'unlimited' → NaN rejected, default kept (would drop the cap)", () => {
+  const r = parsePositiveInt("unlimited", 5 * 1024 * 1024);
+  assert.equal(r.value, 5 * 1024 * 1024);
+  assert.equal(r.ok, false);
+});
+
+test("parsePositiveInt: '5MB' → unit suffix rejected (naive parseInt would give 5 bytes)", () => {
+  const r = parsePositiveInt("5MB", 5 * 1024 * 1024);
+  assert.equal(r.value, 5 * 1024 * 1024);
+  assert.equal(r.ok, false);
+});
+
+test("parsePositiveInt: '0' and '-1' → non-positive rejected", () => {
+  assert.equal(parsePositiveInt("0", 20).ok, false);
+  assert.equal(parsePositiveInt("0", 20).value, 20);
+  assert.equal(parsePositiveInt("-1", 20).ok, false);
+});
+
+test("parsePositiveInt: '20.5' → fractional/ambiguous rejected", () => {
+  assert.equal(parsePositiveInt("20.5", 20).ok, false);
+});
+
+test("parsePositiveInt: surrounding whitespace tolerated", () => {
+  assert.deepEqual(parsePositiveInt("  20  ", 5), { value: 20, ok: true });
+});
+
+// ── PR #154 review round 2, gap (a): MAX_PROMPT_CHARS must fail closed like the other caps ──
+// server.mjs now derives MAX_PROMPT_CHARS via parseIntEnv → parsePositiveInt (was a raw parseInt).
+// CLAUDE_MAX_PROMPT_CHARS=unlimited previously → NaN → enforceTextBudget's `!(NaN > 0)` early-return
+// → 500k chars passed unbounded, defeating F2's text-budget guarantee. The default must be kept.
+test("parsePositiveInt: CLAUDE_MAX_PROMPT_CHARS='unlimited' → default kept, cap not lost to NaN (gap a)", () => {
+  const r = parsePositiveInt("unlimited", 150000);
+  assert.equal(r.ok, false);
+  assert.equal(r.value, 150000, "the 150k text budget must survive a bad config, not become NaN");
+});
+test("parsePositiveInt: CLAUDE_MAX_PROMPT_CHARS valid override honored", () => {
+  assert.deepEqual(parsePositiveInt("200000", 150000), { value: 200000, ok: true });
+});
+
 // ── messages guard predicate truth-table (issue #110) ────────────────────────
 // Mirrors the guard at server.mjs line ~1650: Array.isArray(x) && x.length > 0
 console.log("\nmessages guard predicate (issue #110):");
@@ -3369,6 +4386,10 @@ test("models.json aliases.sonnet === 'claude-sonnet-5' (default-request-model SP
   assert.equal(_spotModels.aliases.sonnet, "claude-sonnet-5");
 });
 
+test("models.json aliases.opus === 'claude-opus-5' (opus-alias SPOT)", () => {
+  assert.equal(_spotModels.aliases.opus, "claude-opus-5");
+});
+
 // ── Referential integrity (PR #152 review) ──────────────────────────────────
 // The value-mirror assertions above only prove the alias equals a string literal —
 // they pass even if that literal points at a model that does not exist in
@@ -3382,15 +4403,137 @@ test("models.json: claude-sonnet-5 is present in models[] (the entry this PR add
   assert.ok(_spotModelIds.has("claude-sonnet-5"), "claude-sonnet-5 must exist as a models[].id");
 });
 
+test("models.json: claude-opus-5 is present in models[] (the entry this PR adds)", () => {
+  assert.ok(_spotModelIds.has("claude-opus-5"), "claude-opus-5 must exist as a models[].id");
+});
+
+// The prompt-char budget is GLOBAL (max across every entry × 3 chars/token), not
+// per-model — see lib/prompt.mjs derivePromptCharBudget. An entry declaring a native 1M
+// window would therefore raise the truncation ceiling for claude-haiku-4-5 too (genuinely
+// 200k), turning OCP-side truncation into an upstream API rejection.
+//
+// Asserts the MAX, deliberately, not every entry: ADR 0009 states the budget "scales
+// automatically — no code change", so a future entry with a SMALLER window (say a 128k
+// model) must stay legal and must not fail this suite. Only raising the ceiling is the
+// hazard, and that is an ADR-level decision requiring per-model budgets first.
+test("models.json: max contextWindow is 200000 (global prompt-budget ceiling)", () => {
+  const windows = _spotModels.models.map(m => m.contextWindow);
+  assert.equal(Math.max(...windows), 200000,
+    `max contextWindow re-scales MAX_PROMPT_CHARS for ALL models incl. the 200k-native haiku (see lib/prompt.mjs + ADR 0009)`);
+});
+
 test("models.json: every aliases value resolves to a real models[].id (referential integrity)", () => {
   for (const [name, target] of Object.entries(_spotModels.aliases)) {
     assert.ok(_spotModelIds.has(target), `aliases.${name} -> '${target}' is a dangling alias (no matching models[].id)`);
   }
 });
 
+// maxTokens is ADVERTISED metadata, not an OCP-enforced limit (#195). OCP never reads it —
+// buildCliArgs passes no output-token flag to the CLI — and OpenClaw reaches a local OCP over
+// `openai-completions`, whose request field (max_completion_tokens) appears nowhere in this repo.
+// It is consumed only by clients that choose to honour it, via setup.mjs / sync-openclaw.mjs /
+// ocp-connect. So the invariant worth testing is simply that models.json tells the truth: each
+// value must equal the model's max_output_tokens.default in the CLI registry.
+//
+// Pinned per model deliberately. A threshold assertion would let every entry sit at some arbitrary
+// value above the bar and still call itself "registry-aligned" — which is the actual claim. Adding
+// a model means adding a row here, and that is the point: the row is where you record what the
+// registry said when you checked.
+// Keys are models.json ids; values are the CLI 2.1.220 registry's max_output_tokens.default,
+// each extracted id-anchored (grep 'id:"<id>"' + the following bytes) — never by bare-string
+// search, which matches cross-references inside OTHER models' records and silently attributes
+// the wrong number. ONE KEY IS NOT A REGISTRY ID: models.json carries the dated haiku id, but
+// the registry record is id:"claude-haiku-4-5" (the dated string appears only as that record's
+// provider_ids.first_party). Anchor the haiku row on the SHORT id; anchoring on the dated one
+// returns nothing, which is what tempts the next reader back into a bare-string search.
+const _spotRegistryMaxTokens = {
+  "claude-opus-5": 64000, "claude-opus-4-8": 64000, "claude-opus-4-7": 64000, "claude-opus-4-6": 64000,
+  "claude-sonnet-5": 64000, "claude-sonnet-4-6": 32000,
+  "claude-haiku-4-5-20251001": 32000,       // registry id: claude-haiku-4-5
+};
+test("models.json: every maxTokens equals the CLI registry's max_output_tokens.default (#195)", () => {
+  for (const m of _spotModels.models) {
+    const want = _spotRegistryMaxTokens[m.id];
+    assert.ok(want !== undefined,
+      `${m.id} has no recorded registry value — extract it id-anchored from the CLI binary and add a row`);
+    assert.equal(m.maxTokens, want, `${m.id}: models.json says ${m.maxTokens}, CLI registry says ${want}`);
+  }
+});
+
 test("models.json: every legacyAliases value resolves to a real models[].id (referential integrity)", () => {
   for (const [name, target] of Object.entries(_spotModels.legacyAliases || {})) {
     assert.ok(_spotModelIds.has(target), `legacyAliases.${name} -> '${target}' is a dangling alias (no matching models[].id)`);
+  }
+});
+
+// ── models.json validates against models.schema.json (#196) ─────────────────
+// models.json carried `"$schema": "./models.schema.json"` while that file had never been
+// committed, so the SPOT that ADR 0003 makes canonical had no structural validation at all —
+// a missing contextWindow or a typo'd openclawName would only surface downstream, in OpenClaw
+// or in a truncation budget. Validated with the repo's OWN validator (lib/structured-output.mjs,
+// shipped for #153) rather than a new dependency: zero deps added, and it exercises that
+// validator on a second real input.
+//
+// The schema deliberately does NOT try to express referential integrity (alias -> models[].id);
+// that is not a JSON Schema concept and is covered by the two tests directly above.
+import { validateJsonSchema as _spotValidate } from "./lib/structured-output.mjs";
+
+const _spotSchema = JSON.parse(spotReadFileSync(spotJoin(_spotDir, "models.schema.json"), "utf8"));
+
+test("models.json: the $schema reference resolves to a committed file", () => {
+  assert.equal(_spotModels.$schema, "./models.schema.json", "models.json must point at the schema");
+  assert.ok(_ltExists(spotJoin(_spotDir, "models.schema.json")),
+    "models.schema.json must exist — a dangling $schema is what #196 was filed for");
+});
+
+test("models.json validates against models.schema.json (strict)", () => {
+  const errors = _spotValidate(_spotModels, _spotSchema, "$", true);
+  assert.deepEqual(errors, [], `models.json violates its own schema:\n  ${errors.join("\n  ")}`);
+});
+
+// Three corruptions the SCHEMA structurally cannot catch, asserted directly instead of pretending
+// the schema covers them: the validator has no uniqueItems, no minLength, and no minimum. Adding
+// those keywords to the schema would be silently ignored (see its description), so they live here.
+test("models.json: ids/names are unique, untrimmed-free, and windows are positive (not schema-expressible)", () => {
+  // Uniqueness applies to all three name fields, not just id. scripts/sync-openclaw.mjs maps
+  // `claude-local/<id>` -> { alias: displayName } and writes openclawName as the registry label,
+  // so a duplicate in EITHER collapses two models onto one OpenClaw entry — the same defect class
+  // as a duplicate id, which is why review flagged covering only id as a half-fix.
+  for (const f of ["id", "displayName", "openclawName"]) {
+    const vals = _spotModels.models.map(m => m[f]);
+    const dupes = vals.filter((v, i) => vals.indexOf(v) !== i);
+    assert.equal(new Set(vals).size, vals.length, `duplicate models[].${f}: ${[...new Set(dupes)]}`);
+  }
+  for (const m of _spotModels.models) {
+    for (const f of ["id", "displayName", "openclawName"]) {
+      assert.ok(typeof m[f] === "string" && m[f].length > 0, `${m.id}: ${f} must be a non-empty string`);
+      // === trim(), not trim().length: a padded id passes a trimmed check but is handed VERBATIM
+      // to `claude --model`, so " claude-opus-5" would fail upstream rather than here.
+      assert.equal(m[f], m[f].trim(), `${m.id}: ${f} has leading/trailing whitespace`);
+    }
+    assert.ok(m.contextWindow > 0, `${m.id}: contextWindow must be positive`);
+    assert.ok(m.maxTokens > 0, `${m.id}: maxTokens must be positive`);
+  }
+});
+
+// Guards the guard: if the schema were vacuous (e.g. `{}` or a typo'd `properties`), the test
+// above would pass on anything. Each corruption below must be caught.
+test("models.schema.json actually rejects malformed entries (guard is not vacuous)", () => {
+  const clone = () => JSON.parse(JSON.stringify(_spotModels));
+  const cases = [
+    ["missing required field", m => { delete m.models[0].contextWindow; }],
+    ["wrong scalar type", m => { m.models[0].reasoning = "yes"; }],
+    ["non-integer window", m => { m.models[0].contextWindow = 200000.5; }],
+    ["unknown extra field", m => { m.models[0].tokensPerSecond = 42; }],
+    ["alias mapped to non-string", m => { m.aliases.opus = { id: "x" }; }],
+    ["empty models array", m => { m.models = []; }],
+    ["wrong document version", m => { m.version = 2; }],
+    ["unknown top-level key", m => { m.providers = {}; }],
+  ];
+  for (const [label, corrupt] of cases) {
+    const bad = clone(); corrupt(bad);
+    const errs = _spotValidate(bad, _spotSchema, "$", true);
+    assert.ok(errs.length > 0, `schema failed to reject: ${label}`);
   }
 });
 
@@ -3855,13 +4998,17 @@ test("stream: sink path is keyed by session_id (concurrent panes cannot interlea
   assert.ok(A.endsWith("/aaaa-1111.jsonl"));
 });
 
-test("stream: buildTuiCmd — OFF is byte-for-byte the pre-streaming argv; ON adds only env + --settings", () => {
+test("stream: buildTuiCmd — streaming ON adds env + --settings and drops --safe-mode (hook survives)", () => {
   const off = buildTuiCmd("/bin/claude", "m", "SID", "/h", "cli");
   assert.ok(!off.includes("--settings"), "no --settings when streaming is off");
   assert.ok(!off.includes("OCP_TUI_STREAM_FILE"), "no sink env when streaming is off");
+  assert.ok(off.includes("--safe-mode"), "the non-streaming pane carries --safe-mode");
   const on = buildTuiCmd("/bin/claude", "m", "SID", "/h", "cli", { file: "/d/SID.jsonl", settings: "/d/s.json" });
   assert.ok(on.includes("OCP_TUI_STREAM_FILE='/d/SID.jsonl'"), "sink delivered via the pane env");
   assert.ok(on.includes("--settings '/d/s.json'"));
+  // --safe-mode would disable the MessageDisplay hook registered by --settings, so the
+  // streaming pane must NOT carry it (it keeps the env-var suppression instead).
+  assert.ok(!on.includes("--safe-mode"), "streaming pane omits --safe-mode so the hook fires");
   // must not regress the MCP wall or the pinned effort (#156)
   assert.ok(on.includes("--strict-mcp-config") && on.includes("--disallowedTools 'mcp__*'"), "MCP wall intact");
   assert.ok(on.includes("--effort low"), "OCP_TUI_EFFORT default intact");
@@ -3883,6 +5030,262 @@ test("stream: /health block is additive and exposes the divergence counter", () 
   const legacy = buildTuiHealthBlock({ enabled: false, entrypointMode: "cli", maxConcurrent: 2 }, { lastEntrypoint: null, entrypointMismatches: 0 }, sem);
   assert.equal(legacy.streamEnabled, false);
   assert.equal(legacy.streamDivergences, 0);
+});
+
+// ── OpenAI Structured Outputs (response_format) — lib/structured-output.mjs ──
+import { detectStructuredOutput, validateJsonSchema, validateJsonSchemaSafe, extractJsonPayload, structuredSystemInstruction, StructuredOutputError, resolveMaxAttempts } from "./lib/structured-output.mjs";
+
+test("detectStructuredOutput: json_schema shape", () => {
+  const d = detectStructuredOutput({ response_format: { type: "json_schema", json_schema: { name: "x", strict: true, schema: { type: "object" } } } });
+  assert.equal(d.mode, "schema"); assert.equal(d.strict, true); assert.deepEqual(d.schema, { type: "object" });
+});
+test("detectStructuredOutput: json_object shape", () => {
+  assert.deepEqual(detectStructuredOutput({ response_format: { type: "json_object" } }), { mode: "json_object" });
+});
+test("detectStructuredOutput: json_mode:true alias → json_object", () => {
+  assert.deepEqual(detectStructuredOutput({ json_mode: true }), { mode: "json_object" });
+});
+test("detectStructuredOutput: absent → null (non-structured untouched)", () => {
+  assert.equal(detectStructuredOutput({ messages: [] }), null);
+  assert.equal(detectStructuredOutput({ response_format: "nonsense" }), null);
+  assert.equal(detectStructuredOutput({ json_mode: false }), null);
+});
+test("cacheHash: structured marker isolates JSON requests from the conversational slot", () => {
+  const msgs = [{ role: "user", content: "list 3 fruits" }];
+  const plain = cacheHash("m", msgs, { keyId: "k" });
+  const asJson = cacheHash("m", msgs, { keyId: "k", structured: { mode: "json_object" } });
+  const asSchema = cacheHash("m", msgs, { keyId: "k", structured: { mode: "schema", schema: { type: "array" } } });
+  assert.notEqual(plain, asJson);      // JSON vs prose never collide
+  assert.notEqual(asJson, asSchema);   // different schema → different slot
+  assert.equal(plain, cacheHash("m", msgs, { keyId: "k" })); // unchanged for normal requests
+});
+
+// ── validateJsonSchemaSafe (#181): deep value must NOT crash the handler ─────
+// A recursive schema + a model reply nested ~thousands deep overflows the value-
+// depth recursion → RangeError → the handler used to surface a generic 500. The
+// safe façade turns it into a validation miss (→ retry → refusal). Mutation-proof:
+// replace the wrapper body with a bare `validateJsonSchema(...)` call and the deep
+// test throws instead of returning errors.
+test("validateJsonSchemaSafe: pathologically deep value → errors, never throws", () => {
+  const schema = { $defs: { node: { type: "object", properties: { child: { $ref: "#/$defs/node" } } } }, $ref: "#/$defs/node" };
+  let deep = {};
+  let cur = deep;
+  for (let i = 0; i < 6000; i++) { cur.child = {}; cur = cur.child; } // way past any stack limit
+  let out;
+  assert.doesNotThrow(() => { out = validateJsonSchemaSafe(deep, schema, "$", true); }, "must not throw a RangeError out to the handler");
+  assert.ok(Array.isArray(out) && out.length > 0, "returns a non-empty validation error, so the retry loop yields a refusal not a 500");
+});
+
+test("validateJsonSchemaSafe: well-formed value passes through unchanged (byte-identical to the raw validator)", () => {
+  const schema = { type: "object", required: ["name", "age"], properties: { name: { type: "string" }, age: { type: "integer" } } };
+  assert.deepEqual(validateJsonSchemaSafe({ name: "a", age: 3 }, schema), validateJsonSchema({ name: "a", age: 3 }, schema));
+  assert.deepEqual(validateJsonSchemaSafe({ name: "a" }, schema), validateJsonSchema({ name: "a" }, schema)); // error case matches too
+});
+
+test("validateJsonSchemaSafe: re-throws a non-RangeError so genuine bugs aren't masked as a validation miss", () => {
+  // A schema whose `required` is a non-iterable makes the inner validator throw a TypeError — that's
+  // a real bug, not a deep-value overflow, and must surface (not be swallowed as "did not validate").
+  assert.throws(() => validateJsonSchemaSafe({ x: 1 }, { type: "object", required: 42 }), (e) => !(e instanceof RangeError));
+});
+
+test("validateJsonSchema: valid object passes", () => {
+  assert.deepEqual(validateJsonSchema({ name: "a", age: 3 }, { type: "object", required: ["name", "age"], properties: { name: { type: "string" }, age: { type: "integer" } } }), []);
+});
+test("validateJsonSchema: missing required property flagged", () => {
+  assert.ok(validateJsonSchema({ name: "a" }, { type: "object", required: ["name", "age"], properties: {} }).some(e => /age.*required/.test(e)));
+});
+test("validateJsonSchema: additionalProperties:false rejects extra keys", () => {
+  assert.ok(validateJsonSchema({ a: 1, b: 2 }, { type: "object", additionalProperties: false, properties: { a: { type: "integer" } } }).some(e => /b.*additional/.test(e)));
+});
+test("validateJsonSchema: enum rejects non-null value not in list", () => {
+  assert.ok(validateJsonSchema("maybe", { type: "string", enum: ["yes", "no"] }).length > 0);
+});
+test("validateJsonSchema: NULLABLE enum accepts null even when null not in enum (HA regression)", () => {
+  // type:["string","null"] + enum:["Loxone"] — a null value must be accepted (nullability > enum).
+  assert.deepEqual(validateJsonSchema(null, { type: ["string", "null"], enum: ["Loxone"] }), []);
+});
+test("validateJsonSchema: nullable enum still enforces non-null values against the enum", () => {
+  assert.ok(validateJsonSchema("Other", { type: ["string", "null"], enum: ["Loxone"] }).length > 0);
+});
+test("validateJsonSchema: type mismatch flagged", () => {
+  assert.ok(validateJsonSchema("str", { type: "integer" }).length > 0);
+});
+test("validateJsonSchema: array items + minItems", () => {
+  assert.deepEqual(validateJsonSchema([1, 2, 3], { type: "array", items: { type: "integer" }, minItems: 3 }), []);
+  assert.ok(validateJsonSchema([1], { type: "array", items: { type: "integer" }, minItems: 3 }).some(e => /minItems/.test(e)));
+});
+
+test("extractJsonPayload: clean JSON", () => {
+  const r = extractJsonPayload('{"a":1}'); assert.ok(r.ok); assert.deepEqual(r.value, { a: 1 });
+});
+test("extractJsonPayload: fenced ```json block", () => {
+  const r = extractJsonPayload('```json\n{"a":1}\n```'); assert.ok(r.ok); assert.deepEqual(r.value, { a: 1 });
+});
+test("extractJsonPayload: prose-wrapped, string-aware balanced slice", () => {
+  const r = extractJsonPayload('Sure! Here you go: {"note":"has } and { inside"} — hope that helps.');
+  assert.ok(r.ok); assert.deepEqual(r.value, { note: "has } and { inside" });
+});
+test("extractJsonPayload: array payload", () => {
+  const r = extractJsonPayload('[1,2,3]'); assert.ok(r.ok); assert.deepEqual(r.value, [1, 2, 3]);
+});
+test("extractJsonPayload: no JSON → ok:false", () => {
+  assert.equal(extractJsonPayload("I cannot help with that.").ok, false);
+});
+
+test("structuredSystemInstruction: embeds schema, forbids fences, escalates on retry", () => {
+  const first = structuredSystemInstruction({ mode: "schema", schema: { type: "object" } }, 0, "");
+  assert.ok(/code fences/.test(first) && /JSON Schema/.test(first));
+  const retry = structuredSystemInstruction({ mode: "schema", schema: { type: "object" } }, 1, "bad enum");
+  assert.ok(/REJECTED \(bad enum\)/.test(retry));
+});
+test("StructuredOutputError carries reason", () => {
+  const e = new StructuredOutputError("schema validation failed", "raw");
+  assert.equal(e.reason, "schema validation failed"); assert.ok(e instanceof Error);
+});
+
+// ── PR #153 review round 2, MUST-FIX: OCP_STRUCTURED_MAX_ATTEMPTS NaN guard must fail closed ──
+// The old `Math.max(1, parseInt(env||"3",10))` returned NaN for a non-integer value → the retry loop
+// `attempt < NaN` never ran → 0 spawns, every structured request refused. resolveMaxAttempts keeps
+// the default instead of silently bricking the feature.
+test("resolveMaxAttempts: valid integer honored", () => {
+  assert.equal(resolveMaxAttempts("5"), 5);
+  assert.equal(resolveMaxAttempts("1"), 1);
+});
+test("resolveMaxAttempts: unset/empty → default", () => {
+  assert.equal(resolveMaxAttempts(undefined), 3);
+  assert.equal(resolveMaxAttempts(""), 3);
+  assert.equal(resolveMaxAttempts(null), 3);
+});
+test("resolveMaxAttempts: non-integer / non-finite / <1 fails CLOSED to the default (not NaN, not 0)", () => {
+  let warned = 0; const warn = () => { warned++; };
+  for (const bad of ["abc", "0", "-1", "NaN", "Infinity", "  "]) {
+    const v = resolveMaxAttempts(bad, { fallback: 3, warn });
+    assert.equal(v, 3, `bad input ${JSON.stringify(bad)} must fall back to 3, got ${v}`);
+    assert.ok(Number.isFinite(v) && v >= 1, "result is always a usable positive integer");
+  }
+  assert.ok(warned > 0, "invalid values emit a startup warning");
+});
+test("resolveMaxAttempts: the retry loop is never bounded by NaN (regression: 0 spawns / silent refuse)", () => {
+  const attempts = resolveMaxAttempts("abc");
+  let ran = 0;
+  for (let attempt = 0; attempt < attempts; attempt++) ran++;
+  assert.ok(ran >= 1, "loop must execute at least once — pre-fix it ran 0 times");
+});
+
+// ── PR #153 review finding 1: $ref/$defs + strict:true must accept conforming objects ──
+// The flagship shape the OpenAI SDK emits (zodResponseFormat / client.beta.chat.completions.parse)
+// and OpenAI's own structured-outputs docs example: nested {$ref:"#/$defs/step"} + strict:true.
+// Before the fix, strict inferred additionalProperties:false on the unresolved $ref (empty props) and
+// rejected every real key. This is the exact regression the PR must not ship.
+const OPENAI_DOC_SCHEMA = {
+  type: "object",
+  properties: {
+    steps: { type: "array", items: { $ref: "#/$defs/step" } },
+    final_answer: { type: "string" },
+  },
+  $defs: {
+    step: {
+      type: "object",
+      properties: { explanation: { type: "string" }, output: { type: "string" } },
+      required: ["explanation", "output"],
+      additionalProperties: false,
+    },
+  },
+  required: ["steps", "final_answer"],
+  additionalProperties: false,
+};
+
+test("validateJsonSchema: OpenAI doc schema ($ref/$defs) + strict:true accepts a conforming reply", () => {
+  const conforming = { steps: [{ explanation: "add", output: "4" }, { explanation: "done", output: "4" }], final_answer: "4" };
+  assert.deepEqual(validateJsonSchema(conforming, OPENAI_DOC_SCHEMA, "$", true), []);
+});
+
+test("validateJsonSchema: $ref + strict:true still REJECTS a genuinely-extra key (fix didn't disable validation)", () => {
+  const extra = { steps: [{ explanation: "add", output: "4", bogus: 1 }], final_answer: "4" };
+  const errs = validateJsonSchema(extra, OPENAI_DOC_SCHEMA, "$", true);
+  assert.ok(errs.some(e => /bogus.*additional property not allowed/.test(e)), `expected the extra key rejected, got: ${JSON.stringify(errs)}`);
+});
+
+test("validateJsonSchema: $ref + strict:true still catches a missing required property", () => {
+  const missing = { steps: [{ explanation: "add" }], final_answer: "4" };
+  assert.ok(validateJsonSchema(missing, OPENAI_DOC_SCHEMA, "$", true).some(e => /output.*required/.test(e)));
+});
+
+test("validateJsonSchema: anyOf accepts a value matching one branch, rejects a value matching none", () => {
+  const schema = { anyOf: [{ type: "string" }, { type: "integer" }] };
+  assert.deepEqual(validateJsonSchema("hi", schema), []);
+  assert.deepEqual(validateJsonSchema(3, schema), []);
+  assert.ok(validateJsonSchema(true, schema).length > 0);
+});
+
+test("validateJsonSchema: allOf requires every branch to pass", () => {
+  const schema = { allOf: [{ type: "object", properties: { a: { type: "integer" } }, required: ["a"] }, { type: "object", properties: { b: { type: "string" } }, required: ["b"] }] };
+  assert.deepEqual(validateJsonSchema({ a: 1, b: "x" }, schema), []);
+  assert.ok(validateJsonSchema({ a: 1 }, schema).some(e => /b.*required/.test(e)));
+});
+
+test("validateJsonSchema: unresolvable $ref is skipped, not failed", () => {
+  assert.deepEqual(validateJsonSchema({ anything: 1 }, { $ref: "#/$defs/missing" }), []);
+});
+
+// ── PR #153 review round 2, BLOCKER: cyclic $ref must fail closed, not stack-overflow ──
+// A pure ref→ref cycle recurses independent of the data — before the fix ANY reply value (even `5`)
+// threw `RangeError: Maximum call stack size exceeded`, caught upstream as a 500 but only after
+// 1–3 metered spawns → a request-controlled cost-amplification / grief vector on an authed path.
+test("validateJsonSchema: a→b→a cyclic $ref fails closed (no stack overflow) for any value", () => {
+  const schema = { $defs: { a: { $ref: "#/$defs/b" }, b: { $ref: "#/$defs/a" } }, $ref: "#/$defs/a" };
+  let errs;
+  assert.doesNotThrow(() => { errs = validateJsonSchema(5, schema, "$", true); }, "cyclic $ref must not overflow the stack");
+  assert.ok(errs.some(e => /cyclic \$ref/.test(e)), `expected a cyclic-$ref error, got: ${JSON.stringify(errs)}`);
+});
+test("validateJsonSchema: self-referential $ref (a→a) fails closed", () => {
+  const schema = { $defs: { a: { $ref: "#/$defs/a" } }, $ref: "#/$defs/a" };
+  let errs;
+  assert.doesNotThrow(() => { errs = validateJsonSchema({ x: 1 }, schema, "$", true); });
+  assert.ok(errs.some(e => /cyclic \$ref/.test(e)));
+});
+test("validateJsonSchema: cycle routed through anyOf fails closed", () => {
+  const schema = { $defs: { a: { anyOf: [{ $ref: "#/$defs/a" }] } }, $ref: "#/$defs/a" };
+  assert.doesNotThrow(() => validateJsonSchema({ x: 1 }, schema, "$", true));
+});
+test("validateJsonSchema: a LEGITIMATE recursive schema (Node→child:Node) is NOT flagged as a cycle", () => {
+  // Data is a finite tree, so data-consuming recursion terminates — the cycle guard must not
+  // false-positive here (refChain resets across properties/items).
+  const schema = {
+    $defs: { node: { type: "object", properties: { v: { type: "integer" }, child: { $ref: "#/$defs/node" } }, required: ["v"], additionalProperties: false } },
+    $ref: "#/$defs/node",
+  };
+  const tree = { v: 1, child: { v: 2, child: { v: 3 } } };
+  assert.deepEqual(validateJsonSchema(tree, schema, "$", true), []);
+});
+
+// ── PR #153 review finding 2: never serve an unvalidated / ambiguous extraction ──
+test("extractJsonPayload: json_object mode rejects a refusal that merely CONTAINS json", () => {
+  const reply = 'I can\'t do that. For reference the schema looks like {"type":"object"} — sorry.';
+  const r = extractJsonPayload(reply, { whole: true });
+  assert.equal(r.ok, false);
+});
+
+test("extractJsonPayload: json_object mode accepts a whole-reply JSON value", () => {
+  const r = extractJsonPayload('  {"temp":21}  ', { whole: true });
+  assert.ok(r.ok); assert.deepEqual(r.value, { temp: 21 });
+});
+
+test("extractJsonPayload: schema mode rejects >1 top-level JSON value (Schema:{} Answer:{})", () => {
+  const reply = 'Schema: {"type":"object"}\n\nAnswer: {"temp":21}';
+  const r = extractJsonPayload(reply);
+  assert.equal(r.ok, false);
+  assert.ok(/more than one/.test(r.reason || ""));
+});
+
+test("extractJsonPayload: schema mode rejects two competing options rather than silently picking one", () => {
+  const r = extractJsonPayload('Option A:\n{"a":1}\nOption B:\n{"b":2}');
+  assert.equal(r.ok, false);
+});
+
+test("extractJsonPayload: single prose-wrapped value still accepted in schema mode", () => {
+  const r = extractJsonPayload('Sure, here you go: {"a":1} — done.');
+  assert.ok(r.ok); assert.deepEqual(r.value, { a: 1 });
 });
 
 // ── Cleanup ──
