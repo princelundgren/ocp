@@ -52,7 +52,6 @@ The full iron rules are at `~/.claude/CC_DEV_IRON_RULES.md` (symlinked from the 
 
 - Subject line uses Conventional Commits (`fix:`, `feat:`, `docs:`, `refactor:`, `chore:`).
 - Any assertion of the form "Claude Code uses X" or "cli.js uses X" in the body must be immediately followed by a citation in the form `cli.js:NNNN` or `cli.js vE4 <functionName>`. CI performs a soft check for this pattern on all commits in the PR.
-- Co-author trailer is required for LLM-assisted commits (`Co-Authored-By: Claude <model> <noreply@anthropic.com>`).
 
 ---
 
