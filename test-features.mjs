@@ -19950,6 +19950,8 @@ test("buildTuiCmd CLAUDE_ALLOWED_TOOLS=mcp__none empties the tool schema (PL-53 
     assert.equal(argv.filter((a) => a === "--tools").length, 1, `${why}: --tools must appear exactly once`);
     assert.equal(argv[i + 1], "", `${why}: --tools must carry an EMPTY value (empty schema); got ${JSON.stringify(argv[i + 1])}`);
     assert.ok(argv.includes("--strict-mcp-config"), `${why}: --strict-mcp-config missing`);
+    assert.ok(argv.includes("--disable-slash-commands"),
+      `${why}: --disable-slash-commands missing — the CLI's own commands (e.g. /context) run under an empty schema (2026-10-03 review M1)`);
     assert.ok(!argv.includes("--allowedTools"), `${why}: --allowedTools is pre-approval, never a restriction`);
     assert.ok(!argv.includes("mcp__none"), `${why}: the sentinel is a marker, never passed through to claude`);
   };
