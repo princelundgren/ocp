@@ -1564,6 +1564,16 @@ function buildCliArgs(cliModel, systemPromptFile, opts = {}) {
     args.push("--input-format", "stream-json");
   }
 
+  // Fork-local (2026-10-03 review, M1): an empty tool schema does not stop the CLI's OWN slash
+  // commands. Under the lockdown argv, claude 2.1.288 still registered 53 slash commands and 19
+  // skills, and a user message whose text was `/context` ran the CLI's command locally (0 model
+  // turns, a "## Context Usage" table back), as plain text and as a stream-json envelope.
+  // --disable-slash-commands took both counts to 0 and answered "/context isn't available in this
+  // environment." Pushed HERE, ahead of the tool-bridge branch (which returns) and the auth-mode
+  // arms, so every spawn shape of a locked-down instance carries it; the boot capability probe
+  // spawns buildCliArgs' output, so the flag is gated with no second edit.
+  if (ALLOWED_TOOLS_LOCKDOWN) args.push("--disable-slash-commands");
+
   // ADR 0022: the client declared `tools`, so the model holds EXACTLY those and nothing else --
   // that is what the OpenAI contract says it holds, and it is what makes the answer to "which tool
   // did the model choose" unambiguous. Built-in schema emptied the way multi mode empties it;

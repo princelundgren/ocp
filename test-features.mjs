@@ -5395,8 +5395,8 @@ ltTest("integration: CLAUDE_ALLOWED_TOOLS=mcp__none spawns the empty-schema form
       assert.ok(spIdx > -1, `argv has no --system-prompt-file: ${JSON.stringify(argv.slice(0, 8))}`);
       assert.ok(argv.length > spIdx + 2, `argv ends at the system prompt: ${JSON.stringify(argv)}`);
       const tail = argv.slice(spIdx + 2);
-      assert.deepEqual(tail, ["--input-format", "stream-json", "--tools", "", "--strict-mcp-config", "--disallowedTools", "mcp__*"],
-        `the mcp__none sentinel must reach the CLI as the empty-schema form, never --allowedTools: ${JSON.stringify(tail)}`);
+      assert.deepEqual(tail, ["--input-format", "stream-json", "--disable-slash-commands", "--tools", "", "--strict-mcp-config", "--disallowedTools", "mcp__*"],
+        `the mcp__none sentinel must reach the CLI as the empty-schema form with slash commands off, never --allowedTools: ${JSON.stringify(tail)}`);
 
       const banner = buf.out.split("\n").find(l => l.startsWith("Tools: "));
       assert.ok(banner, `no "Tools:" banner line at all — ${ltDiag(buf)}`);
@@ -5433,11 +5433,50 @@ ltTest("integration: CLAUDE_ALLOWED_TOOLS=mcp__none outranks CLAUDE_SKIP_PERMISS
       const spIdx = argv.indexOf("--system-prompt-file");
       assert.ok(spIdx > -1, `argv has no --system-prompt-file: ${JSON.stringify(argv.slice(0, 8))}`);
       const tail = argv.slice(spIdx + 2);
-      assert.deepEqual(tail, ["--input-format", "stream-json", "--tools", "", "--strict-mcp-config", "--disallowedTools", "mcp__*"],
+      assert.deepEqual(tail, ["--input-format", "stream-json", "--disable-slash-commands", "--tools", "", "--strict-mcp-config", "--disallowedTools", "mcp__*"],
         `skip-permissions re-opened the tool surface under lockdown: ${JSON.stringify(tail)}`);
     } finally {
       child.kill("SIGKILL");
       await ltDrain(() => buf.closed, "lockdown-skip-tools", 5000);
+    }
+  } finally { _ltRmRetry(dir); }
+});
+
+// Fork-local (2026-10-03 review, L2): the ADR 0022 tool-bridge branch RETURNS before the lockdown
+// arm, so a request that declares `tools` never reaches ALLOWED_TOOLS_LOCKDOWN's tool flags. The
+// bridge already empties the built-in schema in every mode; this pins that it still does so under
+// the sentinel, with slash commands off, and grants nothing but the client's mcp__ocp__* tools --
+// so an upstream change to that branch reddens here instead of reopening the lockdown silently.
+ltTest("integration (2026-10-03 L2): under mcp__none, a request that declares tools spawns the bridge shape with --tools \"\", slash commands off, and no built-in tools", async () => {
+  if (!LT_POSIX) return;
+  const dir = ltMkdir(); const fake = ltFake(dir);
+  const argvFile = join(dir, "argv-l2.txt");
+  try {
+    const { child, buf, port } = await ltBootFresh({ CLAUDE_AUTH_MODE: "none", CLAUDE_ALLOWED_TOOLS: "mcp__none", CLAUDE_BIN: fake, CLAUDE_TIMEOUT: "20000", ARGV_CAPTURE: argvFile, TOOL_USE_NAME: "lookup_build_id" }, dir);
+    try {
+      assert.ok(await ltWait(() => buf.out.includes("listening on")), `server never listened — ${ltDiag(buf)}`);
+      const TOOL = { type: "function", function: { name: "lookup_build_id", description: "d", parameters: { type: "object", properties: { project: { type: "string" } } } } };
+      const r = await ltPostStatus(port, { model: "sonnet", tools: [TOOL], tool_choice: "auto", messages: [{ role: "user", content: "build id for alpha?" }] });
+      assert.equal(r.status, 200, `${r.status} ${r.text.slice(0, 200)}`);
+      assert.equal(JSON.parse(r.text).choices[0].finish_reason, "tool_calls", `premise: this must be the bridge path — ${r.text.slice(0, 200)}`);
+
+      const argv = ltArgvCalls(argvFile);
+      assert.ok(argv.length > 0, `no argv captured — ${ltDiag(buf)}`);
+      const spIdx = argv.indexOf("--system-prompt-file");
+      assert.ok(spIdx > -1, `argv has no --system-prompt-file: ${JSON.stringify(argv.slice(0, 8))}`);
+      const tail = argv.slice(spIdx + 2);
+      const cfg = tail.indexOf("--mcp-config");
+      assert.ok(cfg > -1 && String(tail[cfg + 1]).endsWith(".json"), `bridge shape must carry its own --mcp-config: ${JSON.stringify(tail)}`);
+      const shape = tail.map((a, i) => (i === cfg + 1 ? "<bridge-config>" : a));
+      assert.deepEqual(shape, ["--input-format", "stream-json", "--disable-slash-commands", "--tools", "", "--mcp-config", "<bridge-config>",
+        "--strict-mcp-config", "--allowedTools", "mcp__ocp__*", "--include-partial-messages"],
+        `the bridge argv under lockdown changed: ${JSON.stringify(tail)}`);
+      for (const builtin of ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "mcp__none", "--dangerously-skip-permissions"]) {
+        assert.ok(!argv.includes(builtin), `a locked-down tool turn must not carry ${builtin}: ${JSON.stringify(tail)}`);
+      }
+    } finally {
+      child.kill("SIGKILL");
+      await ltDrain(() => buf.closed, "lockdown-bridge", 5000);
     }
   } finally { _ltRmRetry(dir); }
 });
